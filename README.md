@@ -127,7 +127,11 @@ This project is designed for Linux.
 
 ## Demo
 
-There is an asciinema recording in `docs/demo.cast`.
+Preview:
+
+![Demo](./docs/demo.gif)
+
+There is also an asciinema recording in `docs/demo.cast`:
 
 ```bash
 asciinema play docs/demo.cast
