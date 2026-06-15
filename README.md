@@ -24,77 +24,48 @@ A lightweight Bash CLI to browse, download, and connect to VPNGate OpenVPN serve
 
 ## Installation
 
+### Quick install (Fedora / Ubuntu / Arch)
+
 ```bash
 git clone https://github.com/AntoineCimino/vpngate-manager.git
 cd vpngate-manager
-chmod +x vpngate-manager.sh
+bash install.sh
 ```
 
-### Manual install (copy the script somewhere in your PATH)
+That’s it. The installer:
+- detects your package manager (dnf / apt / pacman) and installs `openvpn`, `curl`, `iproute`
+- copies the script to `/usr/local/bin/vpn`
 
-If you want a manual install (no clone), you can copy the script to a user bin directory, make it executable, then call it via an alias.
-
-- Copy the script:
-
-```bash
-mkdir -p "$HOME/.local/bin/vpngate"
-cp vpngate-manager.sh "$HOME/.local/bin/vpngate/vpngate-manager.sh"
-```
-
-- Make it executable:
-
-```bash
-chmod +x "$HOME/.local/bin/vpngate/vpngate-manager.sh"
-```
-
-### Alias (bash / zsh)
-
-Add an alias so you can run `vpn start` / `vpn stop` instead of typing the full path.
-
-- **bash**: add this to `~/.bashrc`
-- **zsh**: add this to `~/.zshrc`
-
-```bash
-alias vpn='sudo $HOME/.local/bin/vpngate/vpngate-manager.sh'
-```
-
-Example with an absolute path (as-is):
-
-```bash
-alias vpn='sudo /home/[USERNAME]/.local/bin/vpngate/vpngate-manager.sh'
-```
-
-Reload your shell config:
-
-```bash
-source ~/.bashrc  # or: source ~/.zshrc
-```
-
-Then you can use:
+Then just run:
 
 ```bash
 vpn start
-vpn stop
-vpn status
 ```
 
-### Optional: bypass sudo password (sudoers / NOPASSWD)
+Cache, logs, and downloaded configs are stored in `~/.local/share/vpngate-manager/` — never in system directories.
 
-If you don’t want to type your sudo password every time, you can allow passwordless sudo **only for this script**.
+### Optional: passwordless sudo for openvpn
 
-Edit sudoers safely with:
+OpenVPN needs root. To avoid typing your password every time:
 
 ```bash
 sudo visudo
 ```
 
-Then add a line like (adapt the path and your username):
+Add this line (replace `YOUR_USERNAME`):
 
 ```text
-[USERNAME] ALL=(root) NOPASSWD: /home/[USERNAME]/.local/bin/vpngate/vpngate-manager.sh
+YOUR_USERNAME ALL=(root) NOPASSWD: /usr/sbin/openvpn, /usr/bin/sysctl
 ```
 
-After that, `alias vpn='sudo ...'` will not prompt for a password (for this command only).
+### Manual install
+
+```bash
+git clone https://github.com/AntoineCimino/vpngate-manager.git
+cd vpngate-manager
+sudo cp vpngate-manager.sh /usr/local/bin/vpn
+sudo chmod +x /usr/local/bin/vpn
+```
 
 ## Requirements
 
