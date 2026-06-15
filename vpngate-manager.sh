@@ -2,14 +2,14 @@
 # vpngate-manager.sh - Version 3.0 (Optimized Daemon)
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-VPN_DIR="$SCRIPT_DIR"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/vpngate-manager"
 
-CACHE_FILE="$VPN_DIR/.vpngate_cache.csv"
+CACHE_FILE="$DATA_DIR/.vpngate_cache.csv"
 CACHE_MAX_AGE=3600  # 1 hour
-LOG_FILE="$VPN_DIR/vpn.log"
-PID_FILE="$VPN_DIR/vpn.pid"
+LOG_FILE="$DATA_DIR/vpn.log"
+PID_FILE="$DATA_DIR/vpn.pid"
 
-mkdir -p "$VPN_DIR"
+mkdir -p "$DATA_DIR"
 
 # Display colors
 RED='\033[0;31m'
@@ -165,7 +165,7 @@ function select_vpn() {
     base64_data=$(echo "$base64_data" | tr -d '[:space:]')
     
     # Decode and save
-    local ovpn_file="$VPN_DIR/${country}-vpngate_${ip}_udp.ovpn"
+    local ovpn_file="$DATA_DIR/${country}-vpngate_${ip}_udp.ovpn"
     
     echo "$base64_data" | base64 -d > "$ovpn_file" 2>/dev/null
     
@@ -220,7 +220,7 @@ function list_local_vpns() {
         fi
         
         ((counter++))
-    done < <(find "$VPN_DIR" -name "*.ovpn" -type f 2>/dev/null | sort)
+    done < <(find "$DATA_DIR" -name "*.ovpn" -type f 2>/dev/null | sort)
     
     if [ $counter -eq 1 ]; then
         echo -e "${YELLOW}No .ovpn file found${NC}"
@@ -467,10 +467,10 @@ function show_help() {
     echo -e "  ${GREEN}start [country] [-f]${NC}  Connect to a VPN"
     echo "                        - Without argument: show all available VPN servers"
     echo "                        - With country: filter by country (e.g. japan, france, US)"
-    echo "                        - ${CYAN}-f${NC} : foreground mode (shows logs)"
+    echo -e "                        - ${CYAN}-f${NC} : foreground mode (shows logs)"
     echo ""
     echo -e "  ${GREEN}local [-f]${NC}            Use a local .ovpn file"
-    echo "                        - ${CYAN}-f${NC} : foreground mode"
+    echo -e "                        - ${CYAN}-f${NC} : foreground mode"
     echo ""
     echo -e "  ${GREEN}stop${NC}                  Stop the VPN and clean up"
     echo ""
