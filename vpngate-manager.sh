@@ -167,15 +167,15 @@ function select_vpn() {
     # Decode and save
     local ovpn_file="$DATA_DIR/${country}-vpngate_${ip}_udp.ovpn"
     
-    echo "$base64_data" | base64 -d > "$ovpn_file" 2>/dev/null
-    
-    if [ $? -ne 0 ] || [ ! -s "$ovpn_file" ]; then
+    echo "$base64_data" | base64 -d 2>/dev/null | grep -v "^persist-key" > "$ovpn_file"
+
+    if [ ! -s "$ovpn_file" ]; then
         echo -e "${RED}❌ Error while decoding the configuration${NC}"
-        
+
         # Retry with --ignore-garbage
-        echo "$base64_data" | base64 -d --ignore-garbage > "$ovpn_file" 2>/dev/null
-        
-        if [ $? -ne 0 ] || [ ! -s "$ovpn_file" ]; then
+        echo "$base64_data" | base64 -d --ignore-garbage 2>/dev/null | grep -v "^persist-key" > "$ovpn_file"
+
+        if [ ! -s "$ovpn_file" ]; then
             echo -e "${RED}❌ Decoding failed${NC}"
             rm -f "$temp_data" "$ovpn_file"
             return 1

@@ -9,6 +9,7 @@ SCRIPT="vpngate-manager.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
@@ -36,7 +37,23 @@ sudo rm -f "$INSTALL_PATH"
 sudo cp "$SCRIPT" "$INSTALL_PATH"
 sudo chmod +x "$INSTALL_PATH"
 
-echo -e "${GREEN}✅ Done! You can now use:${NC}"
+echo -e "${GREEN}✅ Done!${NC}"
+echo ""
+
+SUDOERS_FILE="/etc/sudoers.d/vpngate-manager"
+if [ ! -f "$SUDOERS_FILE" ]; then
+    echo -e "${YELLOW}Optional: allow 'vpn start/stop' without typing your sudo password each time?${NC}"
+    read -r -p "Configure passwordless sudo for vpn? [y/N] " answer
+    if [[ "$answer" =~ ^[yY]$ ]]; then
+        CURRENT_USER=$(whoami)
+        SUDOERS_LINE="$CURRENT_USER ALL=(root) NOPASSWD: /usr/sbin/openvpn, /usr/bin/sysctl, /usr/bin/pkill, /bin/kill"
+        echo "$SUDOERS_LINE" | sudo tee "$SUDOERS_FILE" > /dev/null
+        sudo chmod 440 "$SUDOERS_FILE"
+        echo -e "${GREEN}✅ Passwordless sudo configured${NC}"
+    fi
+fi
+
+echo ""
 echo "   vpn start          # browse and connect"
 echo "   vpn start japan    # filter by country"
 echo "   vpn status         # check connection"
