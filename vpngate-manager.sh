@@ -52,7 +52,7 @@ function select_vpn() {
     get_vpn_list || return 1
     
     # Create a temporary file to store VPN selection data
-    local temp_data="$VPN_DIR/.vpn_selection_data"
+    local temp_data="$DATA_DIR/.vpn_selection_data"
     > "$temp_data"
     
     echo -e "${CYAN}🌍 Available VPN servers:${NC}\n"
@@ -202,7 +202,7 @@ function list_local_vpns() {
     echo -e "${CYAN}📁 Local VPN files:${NC}\n"
     
     local counter=1
-    local temp_local="$VPN_DIR/.local_vpn_list"
+    local temp_local="$DATA_DIR/.local_vpn_list"
     > "$temp_local"
     
     while IFS= read -r file; do
