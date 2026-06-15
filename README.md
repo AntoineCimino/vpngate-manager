@@ -24,17 +24,15 @@ A lightweight Bash CLI to browse, download, and connect to VPNGate OpenVPN serve
 
 ## Installation
 
-### Quick install (Fedora / Ubuntu / Arch)
-
 ```bash
 git clone https://github.com/AntoineCimino/vpngate-manager.git
 cd vpngate-manager
 bash install.sh
 ```
 
-That’s it. The installer:
-- detects your package manager (dnf / apt / pacman) and installs `openvpn`, `curl`, `iproute`
-- copies the script to `/usr/local/bin/vpn`
+The installer detects your package manager and installs the required dependencies, then copies the script to `/usr/local/bin/vpn`.
+
+Supported package managers: `dnf` (Fedora, RHEL), `apt` (Debian, Ubuntu, LMDE), `pacman` (Arch).
 
 Then just run:
 
@@ -42,11 +40,20 @@ Then just run:
 vpn start
 ```
 
-Cache, logs, and downloaded configs are stored in `~/.local/share/vpngate-manager/` — never in system directories.
+Cache, logs, and downloaded configs are stored in `~/.local/share/vpngate-manager/`.
 
-### Optional: passwordless sudo for openvpn
+### Manual install
 
-OpenVPN needs root. To avoid typing your password every time:
+```bash
+git clone https://github.com/AntoineCimino/vpngate-manager.git
+cd vpngate-manager
+sudo cp vpngate-manager.sh /usr/local/bin/vpn
+sudo chmod +x /usr/local/bin/vpn
+```
+
+### Optional: passwordless sudo
+
+OpenVPN requires root. To avoid typing your password every time:
 
 ```bash
 sudo visudo
@@ -56,15 +63,6 @@ Add this line (replace `YOUR_USERNAME`):
 
 ```text
 YOUR_USERNAME ALL=(root) NOPASSWD: /usr/sbin/openvpn, /usr/bin/sysctl
-```
-
-### Manual install
-
-```bash
-git clone https://github.com/AntoineCimino/vpngate-manager.git
-cd vpngate-manager
-sudo cp vpngate-manager.sh /usr/local/bin/vpn
-sudo chmod +x /usr/local/bin/vpn
 ```
 
 ## Requirements
@@ -90,7 +88,7 @@ sudo chmod +x /usr/local/bin/vpn
 
 ## Maintenance
 
-The script stores its cache, PID, logs, and downloaded `.ovpn` files next to `vpngate-manager.sh`.
+Cache, PID, logs, and downloaded `.ovpn` files are stored in `~/.local/share/vpngate-manager/`.
 
 ## Windows compatibility
 
