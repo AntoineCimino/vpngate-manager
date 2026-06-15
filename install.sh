@@ -32,6 +32,7 @@ else
 fi
 
 echo -e "${CYAN}📋 Installing vpn command to $INSTALL_PATH...${NC}"
+sudo rm -f "$INSTALL_PATH"
 sudo cp "$SCRIPT" "$INSTALL_PATH"
 sudo chmod +x "$INSTALL_PATH"
 
