@@ -1,6 +1,6 @@
 ## Roadmap
 
-- [ ] Add dependency checks
+- [x] Add dependency checks (tor/iptables environment validation for Tor mode)
 - [ ] Add non-interactive mode
 - [ ] Add config directory override
 - [ ] Add install script
