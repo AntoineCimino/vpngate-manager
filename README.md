@@ -5,6 +5,7 @@ A lightweight Bash CLI to browse, download, and connect to VPNGate OpenVPN serve
 - Interactive VPN server selection
 - Local `.ovpn` file support
 - Background and foreground modes
+- Tor exit node mode for country-specific anonymization
 - Cache, logs, and PID management
 - Simple, single-file Bash script
 
@@ -18,6 +19,7 @@ A lightweight Bash CLI to browse, download, and connect to VPNGate OpenVPN serve
 - Filter servers by country
 - Download and reuse OpenVPN configs locally
 - Run VPN in background or foreground
+- Route traffic through a country-specific Tor exit node when VPNGate has no server there
 - Check status, logs, and active connection info
 - Store everything next to the script for portability
 - Single-file Bash implementation
@@ -65,6 +67,12 @@ Add this line (replace `YOUR_USERNAME`):
 YOUR_USERNAME ALL=(root) NOPASSWD: /usr/sbin/openvpn, /usr/bin/sysctl
 ```
 
+If you also plan to use Tor mode, extend the line to include `tor` and `iptables`:
+
+```text
+YOUR_USERNAME ALL=(root) NOPASSWD: /usr/sbin/openvpn, /usr/bin/sysctl, /usr/bin/tor, /usr/sbin/iptables
+```
+
 ## Requirements
 
 - bash
@@ -74,6 +82,11 @@ YOUR_USERNAME ALL=(root) NOPASSWD: /usr/sbin/openvpn, /usr/bin/sysctl
 - iproute2
 - base64
 
+Optional, only required for Tor mode:
+
+- tor
+- iptables
+
 ## Usage
 
 ```bash
@@ -81,10 +94,44 @@ YOUR_USERNAME ALL=(root) NOPASSWD: /usr/sbin/openvpn, /usr/bin/sysctl
 ./vpngate-manager.sh start japan
 ./vpngate-manager.sh start -f
 ./vpngate-manager.sh local
+./vpngate-manager.sh tor US
 ./vpngate-manager.sh status
 ./vpngate-manager.sh logs
 ./vpngate-manager.sh stop
 ```
+
+## Tor Mode
+
+When VPNGate has no server in the region you need, `tor <country_code>` routes your traffic
+through a Tor exit node in that country instead:
+
+```bash
+./vpngate-manager.sh tor US
+./vpngate-manager.sh tor DE -f   # foreground mode, tails the tor log
+```
+
+Before launching anything, the script validates the environment: it checks that `tor` and
+`iptables` are installed, that `iptables` is actually functional (not an nftables-only system
+without legacy compatibility), and queries the public Tor relay directory to warn you if no exit
+relay is currently known for the requested country.
+
+Traffic is redirected through an isolated `VPNGATE_TOR` iptables chain - your existing iptables
+rules are never modified. `stop` (or Ctrl+C in foreground mode) removes the chain and stops the
+Tor daemon cleanly.
+
+OpenVPN and Tor mode are mutually exclusive: starting one while the other is active will prompt
+you to stop it first.
+
+**Requirements:** `tor`, `iptables`.
+
+**Limitations:**
+
+- Only TCP and DNS (UDP/53) traffic is routed through Tor; other UDP traffic is **not** transparently
+  proxied and leaks outside the Tor tunnel (a known Tor limitation, not specific to this tool).
+- Forcing a specific exit country (`StrictNodes 1`) reduces anonymity compared to letting Tor pick
+  exit nodes freely - use it only when you specifically need a given country's exit IP.
+- This is a transparent SOCKS/DNS proxy setup, not a hardened anonymity solution (no Tails-level
+  isolation). Use Tor Browser instead if strong anonymity is the goal.
 
 ## Maintenance
 
