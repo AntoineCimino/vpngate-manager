@@ -804,6 +804,11 @@ function stop_tor() {
         fi
     fi
 
+    echo -e "${CYAN}🔧 Re-enabling IPv6...${NC}"
+    sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null
+    sudo sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null
+    sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null
+
     rm -f "$TORRC_FILE" "$TOR_PID_FILE" "$TOR_LOG_FILE" "$IPTABLES_RULES_FILE" "$ACTIVE_MODE_FILE"
 
     echo -e "${GREEN}✅ Tor mode stopped cleanly${NC}"
@@ -890,6 +895,16 @@ function start_tor() {
     fi
 
     # --- Config + daemon startup ---
+
+    # Disable IPv6 before any tor/network activity starts. The transparent
+    # proxy rules in apply_tor_iptables() only cover the IPv4 `nat` table, so
+    # any IPv6 traffic would bypass Tor entirely and leak the real address.
+    # Done here (after the confirmation prompts) so an aborted start never
+    # toggles IPv6; re-enabled in stop_tor().
+    echo -e "${CYAN}🔧 Temporarily disabling IPv6...${NC}"
+    sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
+    sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
+    sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null
 
     echo -e "${CYAN}🔧 Generating Tor configuration for exit country '${country_upper}'...${NC}"
     generate_torrc "$country_upper" "$TOR_SOCKS_PORT"
