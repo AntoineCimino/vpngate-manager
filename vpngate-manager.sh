@@ -45,14 +45,14 @@ function download_vpn_list() {
 }
 
 function get_vpn_list() {
-    # Check whether the cache exists and is still recent
+    # Check whether the cache exists, is recent, and has real server entries
     if [ -f "$CACHE_FILE" ]; then
         local cache_age=$(($(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null)))
-        if [ $cache_age -lt $CACHE_MAX_AGE ]; then
+        if [ $cache_age -lt $CACHE_MAX_AGE ] && [ $(wc -l < "$CACHE_FILE") -gt 2 ]; then
             return 0
         fi
     fi
-    
+
     download_vpn_list
 }
 
@@ -348,7 +348,7 @@ function start_vpn() {
                 local vpn_ip=$(ip -4 addr show tun0 2>/dev/null | grep inet | awk '{print $2}')
                 echo -e "${CYAN}   🌐 VPN IP     : $vpn_ip${NC}"
                 
-                local public_ip=$(timeout 5 curl -s ifconfig.me 2>/dev/null)
+                local public_ip=$(timeout 5 curl -s --interface tun0 https://ifconfig.me 2>/dev/null)
                 if [ -n "$public_ip" ]; then
                     echo -e "${CYAN}   🌍 Public IP  : $public_ip${NC}"
                 fi
@@ -475,7 +475,7 @@ function status() {
             echo -e "   ${BLUE}🌐 tun0 interface: $IP${NC}"
 
             echo -e "   ${CYAN}🔍 Checking public IP...${NC}"
-            local PUBLIC_IP=$(timeout 5 curl -s ifconfig.me 2>/dev/null)
+            local PUBLIC_IP=$(timeout 5 curl -s --interface tun0 https://ifconfig.me 2>/dev/null)
             if [ -n "$PUBLIC_IP" ]; then
                 echo -e "   ${GREEN}🌍 Public IP: $PUBLIC_IP${NC}"
             else
