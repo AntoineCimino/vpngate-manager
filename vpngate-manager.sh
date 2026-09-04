@@ -177,7 +177,11 @@ function select_vpn() {
     
     # Decode and save
     local ovpn_file="$DATA_DIR/${country}-vpngate_${ip}_udp.ovpn"
-    
+
+    # ponytail: stale root-owned .ovpn files (leftover from a past sudo run) block the
+    # write since we're not root here; directory is user-owned so we can always remove them.
+    [ -e "$ovpn_file" ] && ! [ -w "$ovpn_file" ] && rm -f "$ovpn_file"
+
     echo "$base64_data" | base64 -d 2>/dev/null | grep -v "^persist-key" > "$ovpn_file"
 
     if [ ! -s "$ovpn_file" ]; then
