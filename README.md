@@ -87,6 +87,10 @@ Optional, only required for Tor mode:
 - tor
 - iptables
 
+Optional, only required for `exec` (per-command VPN, see below):
+
+- [vopono](https://github.com/jamesmcm/vopono)
+
 ## Usage
 
 ```bash
@@ -95,9 +99,23 @@ Optional, only required for Tor mode:
 ./vpngate-manager.sh start -f
 ./vpngate-manager.sh local
 ./vpngate-manager.sh tor US
+./vpngate-manager.sh exec -- curl ifconfig.me
 ./vpngate-manager.sh status
 ./vpngate-manager.sh logs
 ./vpngate-manager.sh stop
+```
+
+### Per-command VPN (`exec`)
+
+`start`/`local`/`tor` route the whole system's traffic. `exec` instead runs a single
+command through the VPN in an isolated network namespace, via
+[vopono](https://github.com/jamesmcm/vopono) — the rest of the system is unaffected.
+A matching server is picked automatically (non-interactive), so it's safe to call
+from another script or program:
+
+```bash
+./vpngate-manager.sh exec -- curl ifconfig.me   # any VPNGate server
+./vpngate-manager.sh exec japan -- firefox      # forced through a Japanese server
 ```
 
 ## Tor Mode

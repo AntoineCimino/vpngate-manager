@@ -399,6 +399,98 @@ function start_vpn() {
     fi
 }
 
+function resolve_ovpn_for_exec() {
+    # Non-interactive counterpart to select_vpn: picks the first matching
+    # server automatically instead of prompting, so `exec` stays scriptable
+    # when called by another program. Prints the resolved .ovpn path on stdout.
+    local filter_country="$1"
+    local skip=$(( ${2:-1} - 1 ))  # pick the Nth matching server (1-based)
+
+    get_vpn_list || return 1
+
+    local line_num=0
+    while IFS= read -r line; do
+        ((line_num++))
+        [ $line_num -le 2 ] && continue
+
+        local ip=$(echo "$line" | cut -d',' -f2)
+        local country_long=$(echo "$line" | cut -d',' -f6)
+        local country_short=$(echo "$line" | cut -d',' -f7)
+
+        [ -z "$ip" ] || [ "$ip" = "IP" ] && continue
+
+        if [ -n "$filter_country" ]; then
+            local filter_upper=$(echo "$filter_country" | tr '[:lower:]' '[:upper:]')
+            if [[ ! "$country_long" =~ $filter_country ]] && \
+               [[ ! "$country_short" =~ $filter_upper ]]; then
+                continue
+            fi
+        fi
+
+        if [ "$skip" -gt 0 ]; then
+            skip=$((skip - 1))
+            continue
+        fi
+
+        country_long=$(echo "$country_long" | sed 's/[^[:alnum:] ]//g')
+
+        local full_line=$(sed -n "${line_num}p" "$CACHE_FILE")
+        local base64_data=$(echo "$full_line" | awk -F',' '{print $NF}' | tr -d '[:space:]')
+        local ovpn_file="$DATA_DIR/${country_short}-vpngate_${ip}_udp.ovpn"
+
+        [ -e "$ovpn_file" ] && ! [ -w "$ovpn_file" ] && rm -f "$ovpn_file"
+
+        echo "$base64_data" | base64 -d --ignore-garbage 2>/dev/null | grep -v "^persist-key" > "$ovpn_file"
+
+        if [ -s "$ovpn_file" ] && grep -q "client" "$ovpn_file" 2>/dev/null; then
+            echo "$ovpn_file"
+            return 0
+        fi
+        rm -f "$ovpn_file"
+    done < "$CACHE_FILE"
+
+    return 1
+}
+
+function exec_vpn() {
+    local filter_country="$1"
+    shift
+    local cmd=("$@")
+
+    if [ ${#cmd[@]} -eq 0 ]; then
+        echo -e "${RED}❌ No command specified${NC}"
+        echo -e "${YELLOW}Usage: $0 exec [country] -- <command...>${NC}"
+        return 1
+    fi
+
+    if ! check_command_exists vopono; then
+        echo -e "${RED}❌ vopono is not installed${NC}"
+        echo -e "${YELLOW}vopono runs a single command in an isolated network namespace${NC}"
+        echo -e "${YELLOW}so only that command goes through the VPN — the rest of the system is untouched.${NC}"
+        echo ""
+        echo -e "  Install: ${CYAN}cargo install vopono${NC}  (or grab a release binary: https://github.com/jamesmcm/vopono)"
+        return 1
+    fi
+
+    echo -e "${CYAN}🔎 Resolving VPN config for isolated exec...${NC}"
+    local ovpn_file
+    ovpn_file=$(resolve_ovpn_for_exec "$filter_country")
+
+    if [ -z "$ovpn_file" ]; then
+        echo -e "${RED}❌ No matching VPN server found${NC}"
+        return 1
+    fi
+
+    echo -e "${BLUE}📁 Using: $(basename "$ovpn_file")${NC}"
+    echo -e "${GREEN}🚀 Running in isolated netns via vopono: ${cmd[*]}${NC}"
+
+    # ponytail: vopono's exact custom-provider flags (--custom / --protocol openvpn)
+    # are best-effort against the documented CLI and unverified here (vopono isn't
+    # installed in this environment) — double-check against `vopono exec --help`
+    # if this errors on a newer/older vopono release.
+    sudo vopono exec --custom "$ovpn_file" --protocol openvpn -- "${cmd[@]}"
+}
+
 function cleanup_openvpn() {
     echo ""
     echo -e "${YELLOW}🛑 Stopping VPN...${NC}"
@@ -996,6 +1088,233 @@ function start_tor() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Netns-isolated VPN mode (host routing table is never touched)
+# ---------------------------------------------------------------------------
+# ponytail: single flat /30 veth link per ns (host 10.200.200.1, ns
+# 10.200.200.2) — good enough for one scraper-facing ns at a time; if
+# multiple concurrent namespaces are ever needed, allocate distinct /30s
+# per ns instead of reusing this one.
+NETNS_SUBNET_HOST="10.200.200.1"
+NETNS_SUBNET_NS="10.200.200.2"
+NETNS_SOCKS_PORT=1080
+
+function netns_iface_names() {
+    # veth names are capped at 15 chars by the kernel; derive short,
+    # deterministic names from the ns name so multiple ns's don't collide.
+    local ns="$1"
+    local h
+    h=$(echo -n "$ns" | md5sum | cut -c1-6)
+    echo "vgh-${h}" "vgc-${h}"
+}
+
+function netns_chain_name() {
+    local ns="$1"
+    echo "VPNGATE_NETNS_$(echo -n "$ns" | md5sum | cut -c1-8)"
+}
+
+function netns_dir() {
+    local ns="$1"
+    echo "$DATA_DIR/netns/${ns}"
+}
+
+function netns_uplink_iface() {
+    ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1
+}
+
+function netns_start() {
+    local filter="$1"
+    local ns="${2:-tennis-vpn}"
+    local index="${3:-1}"
+    if [[ ! "$index" =~ ^[1-9][0-9]*$ ]]; then
+        echo -e "${RED}❌ Invalid server index: expected a positive integer${NC}"
+        return 1
+    fi
+
+    if [[ ! "$ns" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        echo -e "${RED}❌ Invalid namespace name: expected [A-Za-z0-9_-]+${NC}"
+        return 1
+    fi
+
+    if ip netns list 2>/dev/null | grep -q "^${ns}\b"; then
+        echo -e "${YELLOW}⚠️  Namespace '${ns}' already exists. Run '$0 netns-stop ${ns}' first.${NC}"
+        return 1
+    fi
+
+    if ! check_command_exists ip || ! check_command_exists python3; then
+        echo -e "${RED}❌ Requires 'ip' (iproute2) and 'python3'${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}🔎 Resolving VPN config...${NC}"
+    local ovpn_file
+    ovpn_file=$(resolve_ovpn_for_exec "$filter" "$index")
+    if [ -z "$ovpn_file" ]; then
+        echo -e "${RED}❌ No matching VPN server found${NC}"
+        return 1
+    fi
+    echo -e "${BLUE}📁 Using: $(basename "$ovpn_file")${NC}"
+
+    local uplink
+    uplink=$(netns_uplink_iface)
+    if [ -z "$uplink" ]; then
+        echo -e "${RED}❌ Could not determine the host's uplink interface (no default route)${NC}"
+        return 1
+    fi
+
+    local veth_h veth_c chain nsdir
+    read -r veth_h veth_c <<< "$(netns_iface_names "$ns")"
+    chain=$(netns_chain_name "$ns")
+    nsdir=$(netns_dir "$ns")
+    mkdir -p "$nsdir"
+
+    echo -e "${CYAN}🔧 Creating namespace '${ns}' and veth pair (host untouched otherwise)...${NC}"
+    sudo ip netns add "$ns" || return 1
+    sudo ip link add "$veth_h" type veth peer name "$veth_c" netns "$ns" || { sudo ip netns del "$ns"; return 1; }
+
+    sudo ip addr add "${NETNS_SUBNET_HOST}/30" dev "$veth_h"
+    sudo ip link set "$veth_h" up
+    sudo ip netns exec "$ns" ip addr add "${NETNS_SUBNET_NS}/30" dev "$veth_c"
+    sudo ip netns exec "$ns" ip link set "$veth_c" up
+    sudo ip netns exec "$ns" ip link set lo up
+    sudo ip netns exec "$ns" ip route add default via "$NETNS_SUBNET_HOST"
+
+    echo -e "${CYAN}🔧 Scoped NAT for ${ns} (chain ${chain}, uplink ${uplink})...${NC}"
+    sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    sudo iptables -t nat -N "$chain" 2>/dev/null
+    sudo iptables -t nat -F "$chain"
+    sudo iptables -t nat -A "$chain" -s "${NETNS_SUBNET_NS}/30" -o "$uplink" -j MASQUERADE
+    while sudo iptables -t nat -D POSTROUTING -j "$chain" 2>/dev/null; do :; done
+    sudo iptables -t nat -A POSTROUTING -j "$chain"
+    sudo iptables -C FORWARD -s "${NETNS_SUBNET_NS}/30" -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -s "${NETNS_SUBNET_NS}/30" -j ACCEPT
+    sudo iptables -C FORWARD -d "${NETNS_SUBNET_NS}/30" -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -d "${NETNS_SUBNET_NS}/30" -j ACCEPT
+
+    echo -e "${CYAN}🔧 DNS for namespace (public resolvers, not the host's)...${NC}"
+    sudo mkdir -p "/etc/netns/${ns}"
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee "/etc/netns/${ns}/resolv.conf" >/dev/null
+
+    echo -e "${CYAN}🚀 Starting OpenVPN inside the namespace...${NC}"
+    local vpn_log="$nsdir/openvpn.log" vpn_pid="$nsdir/openvpn.pid"
+    rm -f "$vpn_log" "$vpn_pid"
+    sudo ip netns exec "$ns" openvpn --config "$ovpn_file" \
+        --data-ciphers AES-128-CBC:AES-256-CBC:AES-128-GCM:AES-256-GCM \
+        --daemon --log "$vpn_log" --writepid "$vpn_pid"
+
+    local waited=0 max_wait=60
+    while [ $waited -lt $max_wait ]; do
+        sleep 1
+        ((waited++))
+        if sudo ip netns exec "$ns" ip a 2>/dev/null | grep -q "tun0"; then
+            break
+        fi
+        if [ -f "$vpn_pid" ] && ! ps -p "$(cat "$vpn_pid")" > /dev/null 2>&1; then
+            echo -e "${RED}❌ OpenVPN failed to start inside namespace${NC}"
+            tail -n 10 "$vpn_log" 2>/dev/null | sed 's/^/   /'
+            netns_stop "$ns"
+            return 1
+        fi
+    done
+    if ! sudo ip netns exec "$ns" ip a 2>/dev/null | grep -q "tun0"; then
+        echo -e "${RED}❌ OpenVPN did not come up inside namespace within ${max_wait}s${NC}"
+        tail -n 15 "$vpn_log" 2>/dev/null | sed 's/^/   /'
+        netns_stop "$ns"
+        return 1
+    fi
+
+    echo -e "${CYAN}🚀 Starting SOCKS5 proxy on ${NETNS_SUBNET_NS}:${NETNS_SOCKS_PORT}...${NC}"
+    local socks_log="$nsdir/socks5.log" socks_pid="$nsdir/socks5.pid"
+    rm -f "$socks_log" "$socks_pid"
+    sudo ip netns exec "$ns" python3 "$SCRIPT_DIR/netns-socks5.py" "$NETNS_SUBNET_NS" "$NETNS_SOCKS_PORT" \
+        > "$socks_log" 2>&1 &
+    disown
+    # daemonized via ip netns exec's own child; record via pgrep inside the ns instead
+    sleep 1
+    local socks_pid_val
+    socks_pid_val=$(sudo ip netns exec "$ns" pgrep -f "[n]etns-socks5.py" | head -n1)
+    if [ -z "$socks_pid_val" ]; then
+        echo -e "${RED}❌ SOCKS5 proxy failed to start${NC}"
+        cat "$socks_log" 2>/dev/null | sed 's/^/   /'
+        netns_stop "$ns"
+        return 1
+    fi
+    echo "$socks_pid_val" > "$socks_pid"
+
+    echo -e "${GREEN}✅ Namespace '${ns}' ready${NC}"
+    echo -e "   ${CYAN}🧦 SOCKS5 proxy: socks5://${NETNS_SUBNET_NS}:${NETNS_SOCKS_PORT}${NC}"
+    echo -e "   ${CYAN}📄 Logs: ${vpn_log} / ${socks_log}${NC}"
+    echo -e "   ${YELLOW}$0 netns-status ${ns}${NC}  - check exit IP"
+    echo -e "   ${YELLOW}$0 netns-stop ${ns}${NC}    - tear down"
+    return 0
+}
+
+function netns_status() {
+    local ns="${1:-tennis-vpn}"
+
+    if ! ip netns list 2>/dev/null | grep -q "^${ns}\b"; then
+        echo -e "${RED}❌ Namespace '${ns}' does not exist${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}📊 Namespace '${ns}' status:${NC}\n"
+    echo -e "   ${CYAN}🧦 SOCKS5 proxy: socks5://${NETNS_SUBNET_NS}:${NETNS_SOCKS_PORT}${NC}"
+
+    if sudo ip netns exec "$ns" ip a 2>/dev/null | grep -q "tun0"; then
+        echo -e "   ${GREEN}✅ OpenVPN tun0 up inside namespace${NC}"
+    else
+        echo -e "   ${YELLOW}⚠️  No tun0 inside namespace${NC}"
+    fi
+
+    echo -e "   ${CYAN}🔍 Exit IP as seen through the proxy...${NC}"
+    local exit_ip
+    exit_ip=$(timeout 10 curl -s --socks5-hostname "${NETNS_SUBNET_NS}:${NETNS_SOCKS_PORT}" https://ifconfig.me 2>/dev/null)
+    if [ -n "$exit_ip" ]; then
+        echo -e "   ${GREEN}🌍 Exit IP: ${exit_ip}${NC}"
+    else
+        echo -e "   ${YELLOW}⚠️  Unable to retrieve exit IP${NC}"
+    fi
+}
+
+function netns_stop() {
+    local ns="${1:-tennis-vpn}"
+
+    if ! ip netns list 2>/dev/null | grep -q "^${ns}\b"; then
+        echo -e "${YELLOW}No namespace '${ns}' to stop${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}🛑 Stopping namespace '${ns}'...${NC}"
+
+    local nsdir
+    nsdir=$(netns_dir "$ns")
+
+    # Kill proxy + openvpn from inside the namespace first (works even if
+    # our host-side pidfiles are missing/stale).
+    sudo ip netns exec "$ns" pkill -TERM -f "[n]etns-socks5.py" 2>/dev/null
+    sudo ip netns exec "$ns" pkill -TERM openvpn 2>/dev/null
+    sleep 1
+    sudo ip netns exec "$ns" pkill -9 -f "[n]etns-socks5.py" 2>/dev/null
+    sudo ip netns exec "$ns" pkill -9 openvpn 2>/dev/null
+
+    sudo ip netns del "$ns" 2>/dev/null
+
+    local veth_h veth_c chain
+    read -r veth_h veth_c <<< "$(netns_iface_names "$ns")"
+    chain=$(netns_chain_name "$ns")
+
+    sudo ip link del "$veth_h" 2>/dev/null
+
+    while sudo iptables -t nat -D POSTROUTING -j "$chain" 2>/dev/null; do :; done
+    sudo iptables -t nat -F "$chain" 2>/dev/null
+    sudo iptables -t nat -X "$chain" 2>/dev/null
+    sudo iptables -D FORWARD -s "${NETNS_SUBNET_NS}/30" -j ACCEPT 2>/dev/null
+    sudo iptables -D FORWARD -d "${NETNS_SUBNET_NS}/30" -j ACCEPT 2>/dev/null
+
+    sudo rm -rf "/etc/netns/${ns}"
+    rm -rf "$nsdir"
+
+    echo -e "${GREEN}✅ Namespace '${ns}' stopped, nothing left on the host${NC}"
+}
+
 function stop_vpn() {
     if ! pgrep -x openvpn > /dev/null && ! is_our_tor_running; then
         echo -e "${YELLOW}No active VPN${NC}"
@@ -1028,11 +1347,25 @@ function show_help() {
     echo ""
     echo -e "  ${GREEN}stop${NC}                  Stop the VPN/Tor mode and clean up"
     echo ""
+    echo -e "  ${GREEN}netns-start [country] [ns=tennis-vpn] [n=1]${NC}"
+    echo "                        Start a VPN fully isolated in a network namespace"
+    echo "                        - Host routing table / default IP are never touched"
+    echo "                        - Exposes a SOCKS5 proxy reachable from the host"
+    echo "                        - For scripts/agents/timers; never changes the user's own connectivity"
+    echo -e "  ${GREEN}netns-status [ns=tennis-vpn]${NC}  Show proxy URL + exit IP"
+    echo -e "  ${GREEN}netns-stop [ns=tennis-vpn]${NC}    Tear down namespace, veth, iptables chain, proxy"
+    echo ""
     echo -e "  ${GREEN}status${NC}                Show connection status (OpenVPN or Tor)"
     echo ""
     echo -e "  ${GREEN}logs${NC}                  Show logs in real time"
     echo ""
     echo -e "  ${GREEN}refresh${NC}               Force refresh of the VPN list"
+    echo ""
+    echo -e "  ${GREEN}exec [country] -- <cmd...>${NC}  Run <cmd> through the VPN only,"
+    echo "                        via vopono, in an isolated network namespace"
+    echo "                        - The rest of the system's traffic is unaffected"
+    echo "                        - Server is picked automatically (non-interactive)"
+    echo -e "                        - Requires: ${CYAN}vopono${NC} (https://github.com/jamesmcm/vopono)"
     echo ""
     echo -e "  ${GREEN}help${NC}                  Show this help"
     echo ""
@@ -1052,6 +1385,8 @@ function show_help() {
     echo "  $0 status             # Check whether the VPN/Tor mode is active"
     echo "  $0 logs               # Follow logs in real time"
     echo "  $0 stop               # Stop the VPN or Tor mode"
+    echo "  $0 exec -- curl ifconfig.me         # Just this command through the VPN"
+    echo "  $0 exec japan -- firefox            # Same, forced through a Japanese server"
     echo ""
 }
 
@@ -1091,6 +1426,15 @@ case "${1:-help}" in
     stop)
         stop_vpn
         ;;
+    netns-start)
+        netns_start "$2" "$3" "$4"
+        ;;
+    netns-status)
+        netns_status "$2"
+        ;;
+    netns-stop)
+        netns_stop "$2"
+        ;;
     status)
         status
         ;;
@@ -1099,6 +1443,16 @@ case "${1:-help}" in
         ;;
     refresh)
         download_vpn_list
+        ;;
+    exec)
+        shift
+        country=""
+        if [ -n "$1" ] && [ "$1" != "--" ]; then
+            country="$1"
+            shift
+        fi
+        [ "$1" = "--" ] && shift
+        exec_vpn "$country" "$@"
         ;;
     help|--help|-h)
         show_help
