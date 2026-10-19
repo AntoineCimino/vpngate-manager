@@ -31,16 +31,16 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 function download_vpn_list() {
-    echo -e "${CYAN}📥 Downloading the list of available VPN servers...${NC}"
+    echo -e "${CYAN}📥 Downloading the list of available VPN servers...${NC}" >&2
     
     curl -s "http://www.vpngate.net/api/iphone/" -o "$CACHE_FILE"
     
     if [ $? -ne 0 ] || [ ! -s "$CACHE_FILE" ]; then
-        echo -e "${RED}❌ Failed to download the VPN list${NC}"
+        echo -e "${RED}❌ Failed to download the VPN list${NC}" >&2
         return 1
     fi
     
-    echo -e "${GREEN}✅ VPN list downloaded successfully${NC}"
+    echo -e "${GREEN}✅ VPN list downloaded successfully${NC}" >&2
     return 0
 }
 
