@@ -30,30 +30,59 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
+VPNGATE_API_URL="${VPNGATE_API_URL:-http://www.vpngate.net/api/iphone/}"
+VPNGATE_DOWNLOAD_MAX_TIME="${VPNGATE_DOWNLOAD_MAX_TIME:-30}"
+
+# A list is valid when it has > 2 lines and at least one real server row
+# (IPv4 in field 2, numeric score in field 3).
+function is_valid_vpn_list() {
+    local f="$1"
+    [ -s "$f" ] || return 1
+    [ "$(wc -l < "$f")" -gt 2 ] || return 1
+    tail -n +3 "$f" | awk -F, '$2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $3 ~ /^[0-9]+$/ {found=1; exit} END {exit !found}'
+}
+
 function download_vpn_list() {
     echo -e "${CYAN}📥 Downloading the list of available VPN servers...${NC}" >&2
-    
-    curl -s "http://www.vpngate.net/api/iphone/" -o "$CACHE_FILE"
-    
-    if [ $? -ne 0 ] || [ ! -s "$CACHE_FILE" ]; then
-        echo -e "${RED}❌ Failed to download the VPN list${NC}" >&2
+
+    # Download to a temp file in the same dir; only a valid result replaces the cache.
+    local tmp_file
+    tmp_file=$(mktemp "$DATA_DIR/.vpngate_cache.XXXXXX") || {
+        echo -e "${RED}❌ Failed to download the VPN list (cannot create temp file)${NC}" >&2
         return 1
+    }
+
+    if curl -s --fail --max-time "$VPNGATE_DOWNLOAD_MAX_TIME" "$VPNGATE_API_URL" -o "$tmp_file" \
+        && is_valid_vpn_list "$tmp_file"; then
+        chmod 664 "$tmp_file"
+        mv -f "$tmp_file" "$CACHE_FILE"
+        echo -e "${GREEN}✅ VPN list downloaded successfully${NC}" >&2
+        return 0
     fi
-    
-    echo -e "${GREEN}✅ VPN list downloaded successfully${NC}" >&2
-    return 0
+
+    rm -f "$tmp_file"
+    echo -e "${RED}❌ Failed to download the VPN list${NC}" >&2
+    return 1
 }
 
 function get_vpn_list() {
-    # Check whether the cache exists, is recent, and has real server entries
-    if [ -f "$CACHE_FILE" ]; then
-        local cache_age=$(($(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null)))
-        if [ $cache_age -lt $CACHE_MAX_AGE ] && [ $(wc -l < "$CACHE_FILE") -gt 2 ]; then
+    local cache_valid=0 cache_age=0
+    if [ -f "$CACHE_FILE" ] && is_valid_vpn_list "$CACHE_FILE"; then
+        cache_valid=1
+        cache_age=$(($(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null)))
+        if [ $cache_age -lt $CACHE_MAX_AGE ]; then
             return 0
         fi
     fi
 
-    download_vpn_list
+    download_vpn_list && return 0
+
+    if [ $cache_valid -eq 1 ]; then
+        echo -e "${YELLOW}⚠️  WARNING: VPNGate download failed; using stale cache (age: $((cache_age / 60)) min)${NC}" >&2
+        return 0
+    fi
+    echo -e "${RED}❌ No valid VPN list available (download failed and no usable cache)${NC}" >&2
+    return 1
 }
 
 function select_vpn() {
@@ -102,7 +131,7 @@ function select_vpn() {
         # Filter by country if specified
         if [ -n "$filter_country" ]; then
             local filter_upper=$(echo "$filter_country" | tr '[:lower:]' '[:upper:]')
-            if [[ ! "$country_long" =~ $filter_country ]] && \
+            if [[ ! "${country_long,,}" =~ ${filter_country,,} ]] && \
                [[ ! "$country_short" =~ $filter_upper ]]; then
                 continue
             fi
@@ -421,7 +450,7 @@ function resolve_ovpn_for_exec() {
 
         if [ -n "$filter_country" ]; then
             local filter_upper=$(echo "$filter_country" | tr '[:lower:]' '[:upper:]')
-            if [[ ! "$country_long" =~ $filter_country ]] && \
+            if [[ ! "${country_long,,}" =~ ${filter_country,,} ]] && \
                [[ ! "$country_short" =~ $filter_upper ]]; then
                 continue
             fi
