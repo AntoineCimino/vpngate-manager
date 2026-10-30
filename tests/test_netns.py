@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import socket
 import shutil
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -66,6 +67,11 @@ class NetnsKernelTests(unittest.TestCase):
     def test_lifecycle_and_fail_closed_egress(self):
         if not shutil.which("unshare"):
             self.skipTest("unshare unavailable")
+        for command in ('unshare', 'ip', 'iptables', 'openvpn', 'curl', 'flock'):
+            if not shutil.which(command):
+                self.skipTest(f'{command} is unavailable')
+        if not all(Path(p).is_dir() for p in ('/etc/netns', '/run/netns')):
+            self.skipTest('Create /etc/netns and /run/netns before running kernel tests')
         probe = subprocess.run(["unshare", "-Urnm", "true"], capture_output=True)
         if probe.returncode:
             self.skipTest("unprivileged user/network/mount namespaces unavailable")

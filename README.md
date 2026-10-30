@@ -7,7 +7,7 @@ A lightweight Bash CLI to browse, download, and connect to VPNGate OpenVPN serve
 - Background and foreground modes
 - Tor exit node mode for country-specific anonymization
 - Cache, logs, and PID management
-- Simple, single-file Bash script
+- Bash CLI with small Python standard-library helpers
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Bash](https://img.shields.io/badge/bash-5%2B-green.svg)
@@ -21,8 +21,8 @@ A lightweight Bash CLI to browse, download, and connect to VPNGate OpenVPN serve
 - Run VPN in background or foreground
 - Route traffic through a country-specific Tor exit node when VPNGate has no server there
 - Check status, logs, and active connection info
-- Store everything next to the script for portability
-- Single-file Bash implementation
+- Configurable data directory for cache, configs, logs, and recovery state
+- Isolated VPN namespaces, reversible DNS settings, and automated regression tests
 
 ## Installation
 
@@ -49,8 +49,8 @@ Cache, logs, and downloaded configs are stored in `~/.local/share/vpngate-manage
 ```bash
 git clone https://github.com/AntoineCimino/vpngate-manager.git
 cd vpngate-manager
-sudo cp vpngate-manager.sh /usr/local/bin/vpn
-sudo chmod +x /usr/local/bin/vpn
+sudo install -m 755 vpngate-manager.sh /usr/local/bin/vpn
+sudo install -m 755 netns-socks5.py tor-dns.py cloudflare-dns.py /usr/local/bin/
 ```
 
 ### Optional: passwordless sudo
@@ -81,6 +81,8 @@ YOUR_USERNAME ALL=(root) NOPASSWD: /usr/sbin/openvpn, /usr/bin/sysctl, /usr/bin/
 - sudo
 - iproute2
 - base64
+- python3 (standard library only)
+- util-linux (`flock`, for serialized lifecycle operations)
 
 Optional, only required for Tor mode:
 
@@ -146,6 +148,29 @@ working SOCKS handshake; failures roll back setup. Namespace mode requires
 numeric IPv4 server addresses in the VPNGate profile. `stop` affects the host
 VPN/Tor session; use `netns-stop` to stop the isolated session.
 
+### Explicit server selection for scripts
+
+`start --auto [country]` selects the first matching server without prompting;
+`local --file PATH [-f]` uses an explicit local profile. They retain the
+host-wide behavior of `start`/`local`. Existing-session replacement still
+requires explicit confirmation; unattended callers fail rather than replace it.
+Use `netns-start` or `exec` for jobs that must preserve the host's connectivity.
+
+### Optional Cloudflare DNS
+
+```bash
+vpn dns benchmark --samples 9
+vpn dns status
+vpn dns enable
+vpn dns restore
+```
+
+This is a direct-connection DNS option, with no VPN tunnel or country change.
+Benchmark first: DNS lookup speed and connection bandwidth are different.
+Supported NetworkManager connections get a reversible, temporary DNS override;
+Tailscale/private-DNS/tunnel conflicts are refused. See
+[compatibility, measurements, and recovery](docs/cloudflare-dns.md).
+
 ## Tor Mode
 
 When VPNGate has no server in the region you need, `tor <country_code>` routes your traffic
@@ -163,7 +188,14 @@ relay is currently known for the requested country.
 
 Traffic is redirected through an isolated `VPNGATE_TOR` iptables chain - your existing iptables
 rules are never modified. `stop` (or Ctrl+C in foreground mode) removes the chain and stops the
-Tor daemon cleanly.
+Tor daemon cleanly. Tor uses a dedicated non-root service account so the
+firewall's Tor-process exemption cannot exempt all root traffic. Startup
+verifies the ordinary DNS/TCP path with the Tor Project API and rolls back on
+failure. Original per-interface IPv6 values are saved and restored.
+
+When Tailscale manages DNS, Tor mode temporarily releases that DNS setting and
+restores it on stop or failed startup. MagicDNS/private names can be unavailable
+until stop; namespace mode preserves host DNS. See [Tor DNS and recovery](docs/tor-dns.md).
 
 OpenVPN and Tor mode are mutually exclusive: starting one while the other is active will prompt
 you to stop it first.
@@ -182,10 +214,29 @@ you to stop it first.
 ## Maintenance
 
 Cache, PID, logs, and downloaded `.ovpn` files are stored in `~/.local/share/vpngate-manager/`.
+Override the directory with an absolute `VPNGATE_DATA_DIR` (or set `XDG_DATA_HOME`):
+
+```bash
+VPNGATE_DATA_DIR="$HOME/vpn-configs" vpn refresh
+vpn purge
+```
+
+Use the same directory for start, status and stop. `purge` removes cached lists,
+downloaded/local `.ovpn` files and inactive logs, while preserving unrelated
+files. It refuses to run while session or DNS/IPv6/namespace recovery state
+exists. Stop/restore first; never delete recovery records to force a purge.
 
 ## Windows compatibility
 
-This project is designed for Linux.
+This project requires Linux networking (`ip netns`, TUN, iptables and sysctl).
+WSL2 can work with a kernel that exposes those features and the required
+privileges; install Linux dependencies inside the distribution. Verify
+`test -c /dev/net/tun`, `ip netns list`, and `sudo iptables -t nat -S` before use.
+NetworkManager DNS controls are available only when NetworkManager manages the
+WSL connection. Tor/VPN routing inside WSL2 does not route Windows applications
+through the tunnel; use the explicit SOCKS proxy from Windows if appropriate.
+WSL1 and native Git Bash lack the required Linux network namespaces and are
+unsupported. WSL2 has not been validated in CI.
 
 ## Demo
 
@@ -203,7 +254,7 @@ asciinema play docs/demo.cast
 
 VPNGate Manager is designed to stay simple:
 
-- one Bash file
+- a Bash entry point and small Python standard-library helpers
 - no heavy framework
 - easy to inspect and modify
 - portable across Linux systems
@@ -223,3 +274,34 @@ Please note:
 ## License
 
 MIT. See `LICENSE`.
+## Development and backlog
+
+```bash
+bash -n vpngate-manager.sh install.sh
+python3 -m unittest discover -s tests -v
+```
+
+Kernel integration tests use disposable user/network/mount namespaces and local
+fixtures, including a real OpenVPN TLS server. They skip where the kernel or
+required tools (`unshare`, `ip`, `iptables`, OpenVPN, OpenSSL, curl, TUN) are
+unavailable. They never change the host's routes or use public VPN servers.
+See [ROADMAP.md](ROADMAP.md) for delivery status and remaining validation.
+
+Optional public-network Tor smoke test (Docker required):
+
+```bash
+docker build -t vpngate-integration -f tests/Dockerfile.integration .
+docker run --rm --cap-add NET_ADMIN --cap-add SYS_ADMIN \
+  --security-opt apparmor=unconfined \
+  --sysctl net.ipv6.conf.all.disable_ipv6=1 \
+  --sysctl net.ipv6.conf.default.disable_ipv6=1 \
+  -v "$PWD:/repo:ro" -e VPNGATE_DATA_DIR=/tmp/vpngate-state \
+  -e VPNGATE_LIVE_TEST=1 vpngate-integration bash /repo/tests/live_tor_smoke.sh
+```
+
+This test starts real Tor in the container, verifies ordinary DNS/TCP reaches a
+Tor exit, checks foreground stop from a second invocation, and verifies route,
+firewall and DNS restoration. Tailscale preference changes and MagicDNS are
+represented by a local fixture; it does not log in to a real tailnet or prove
+the original host-specific resolver diagnosis. No host networking is mounted
+or modified. Do not use host networking for this test.

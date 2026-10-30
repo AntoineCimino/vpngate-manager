@@ -1,0 +1,3 @@
+FROM ubuntu:24.04
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iproute2 iptables openvpn tor python3 sudo curl ca-certificates util-linux && rm -rf /var/lib/apt/lists/*
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq network-manager dbus && rm -rf /var/lib/apt/lists/*

@@ -2,7 +2,11 @@
 # vpngate-manager.sh - Version 3.0 (Optimized Daemon)
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/vpngate-manager"
+DATA_DIR="${VPNGATE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/vpngate-manager}"
+if [[ "$DATA_DIR" != /* ]] || [ "$DATA_DIR" = / ]; then
+    echo 'VPNGATE_DATA_DIR must be an absolute directory other than /.' >&2
+    exit 1
+fi
 
 CACHE_FILE="$DATA_DIR/.vpngate_cache.csv"
 CACHE_MAX_AGE=3600  # 1 hour
@@ -20,7 +24,7 @@ TOR_TRANS_PORT=9040
 TOR_DNS_PORT=5353
 TOR_CHAIN="VPNGATE_TOR"
 
-mkdir -p "$DATA_DIR"
+mkdir -p "$DATA_DIR" || exit 1
 
 # Display colors
 RED='\033[0;31m'
@@ -30,7 +34,7 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-VPNGATE_API_URL="${VPNGATE_API_URL:-http://www.vpngate.net/api/iphone/}"
+VPNGATE_API_URL="${VPNGATE_API_URL:-https://www.vpngate.net/api/iphone/}"
 VPNGATE_DOWNLOAD_MAX_TIME="${VPNGATE_DOWNLOAD_MAX_TIME:-30}"
 
 # A list is valid when it has > 2 lines and at least one real server row
@@ -293,6 +297,13 @@ function list_local_vpns() {
     start_vpn "$selected_file" "$mode"
 }
 
+function is_our_openvpn_running() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid
+    pid=$(cat "$PID_FILE")
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] && [ -r "/proc/$pid/comm" ] && [ "$(cat "/proc/$pid/comm")" = openvpn ]
+}
+
 function start_vpn() {
     local ovpn_file="$1"
     local mode="${2:-daemon}"  # daemon by default
@@ -307,13 +318,18 @@ function start_vpn() {
         return 1
     fi
     
+    # Recover a failed Tor session before starting another host-wide mode.
+    if ! is_our_tor_running && { [ -e "$DATA_DIR/tor-runtime" ] || [ -e "$DATA_DIR/tor-ipv6.state" ] || [ -e "$DATA_DIR/tor-dns.json" ]; }; then
+        echo 'Tor recovery is pending; run stop before starting OpenVPN.' >&2
+        return 1
+    fi
     # Tor mode and OpenVPN are mutually exclusive
     if is_our_tor_running; then
         echo -e "${YELLOW}⚠️  Tor mode is currently active${NC}"
         echo -e "${YELLOW}Do you want to stop it and start OpenVPN instead? (y/N)${NC} "
         read -r response
         if [[ "$response" =~ ^[yY]$ ]]; then
-            cleanup
+            cleanup || return 1
             sleep 2
         else
             echo "Cancelled."
@@ -322,12 +338,12 @@ function start_vpn() {
     fi
 
     # Check whether a VPN is already running
-    if pgrep -x openvpn > /dev/null; then
+    if is_our_openvpn_running; then
         echo -e "${YELLOW}⚠️  A VPN is already active${NC}"
         echo -e "${YELLOW}Do you want to stop it and start a new one? (y/N)${NC} "
         read -r response
         if [[ "$response" =~ ^[yY]$ ]]; then
-            cleanup
+            cleanup || return 1
             sleep 2
         else
             echo "Cancelled."
@@ -527,7 +543,7 @@ function cleanup_openvpn() {
     # Read PID from file
     if [ -f "$PID_FILE" ]; then
         local vpn_pid=$(cat "$PID_FILE")
-        if [ -n "$vpn_pid" ]; then
+        if is_our_openvpn_running; then
             sudo kill -TERM "$vpn_pid" 2>/dev/null
             sleep 2
             sudo kill -9 "$vpn_pid" 2>/dev/null
@@ -567,7 +583,7 @@ function cleanup() {
             # process started by this script (own openvpn PID file, or own
             # tor PID file) so a previous crash still gets cleaned up. Never
             # target a system-wide tor/openvpn instance we did not start.
-            if pgrep -x openvpn > /dev/null; then
+            if [ -f "$PID_FILE" ]; then
                 cleanup_openvpn
             elif is_our_tor_running; then
                 stop_tor
@@ -585,7 +601,7 @@ function status() {
     fi
     echo -e "   ${BLUE}🔀 Active mode: ${active_mode}${NC}"
 
-    if pgrep -x openvpn > /dev/null; then
+    if is_our_openvpn_running; then
         echo -e "   ${GREEN}✅ OpenVPN is running${NC}"
 
         if [ -f "$PID_FILE" ]; then
@@ -675,7 +691,23 @@ function check_command_exists() {
     command -v "$cmd" > /dev/null 2>&1
 }
 
+function tor_pid_matches() {
+    local pid="$1"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    python3 - "$pid" "$TORRC_FILE" <<'CHECK_TOR_PID'
+import pathlib, sys
+try:
+    proc = pathlib.Path('/proc') / sys.argv[1]
+    args = (proc / 'cmdline').read_bytes().split(b'\0')
+    valid = (proc / 'comm').read_text().strip() == 'tor' and sys.argv[2].encode() in args
+except OSError:
+    valid = False
+sys.exit(0 if valid else 1)
+CHECK_TOR_PID
+}
+
 function is_our_tor_running() {
+    tor_runtime_paths || return 1
     # `pgrep -x tor` alone is not safe: many distros run a system-wide Tor
     # service (e.g. /etc/tor/torrc, user debian-tor) independently of this
     # script. We must only consider the instance we launched ourselves,
@@ -686,7 +718,7 @@ function is_our_tor_running() {
     fi
     local pid
     pid=$(cat "$TOR_PID_FILE" 2>/dev/null)
-    [ -n "$pid" ] && ps -p "$pid" > /dev/null 2>&1
+    tor_pid_matches "$pid"
 }
 
 function check_iptables_compatibility() {
@@ -768,7 +800,7 @@ function check_tor_ports_free() {
 
     local port
     for port in "$@"; do
-        if ss -ltn 2>/dev/null | grep -q ":${port} "; then
+        if { ss -ltn; ss -lun; } 2>/dev/null | grep -q ":${port} "; then
             echo -e "${RED}❌ Port ${port} is already in use (likely a system-wide tor service)${NC}"
             echo -e "${YELLOW}   Stop it (e.g. 'sudo systemctl stop tor') or free the port, then retry${NC}"
             return 1
@@ -785,7 +817,7 @@ function generate_torrc() {
     local country_code="$1"
     local socks_port="$2"
 
-    cat > "$TORRC_FILE" <<EOF
+    cat <<EOF | sudo tee "$TORRC_FILE" >/dev/null
 ExitNodes {${country_code}}
 StrictNodes 1
 SocksPort ${socks_port}
@@ -816,7 +848,7 @@ function apply_tor_iptables() {
 
     local tor_uid
     tor_uid=$(id -u "$tor_user" 2>/dev/null)
-    if [ -z "$tor_uid" ]; then
+    if [ -z "$tor_uid" ] || [ "$tor_uid" = 0 ] || [ "$tor_uid" = "$(id -u)" ]; then
         echo -e "${RED}❌ Unable to resolve UID for user '$tor_user'${NC}"
         return 1
     fi
@@ -827,42 +859,43 @@ function apply_tor_iptables() {
     # touching VPNGATE_TOR or its OUTPUT jump must use `-t nat`. Using the
     # default `filter` table here would silently fail to redirect anything.
 
-    # Create the isolated chain if missing, flush it if it already exists.
-    # We never touch any other chain or rule owned by the user.
-    if sudo iptables -t nat -L "$TOR_CHAIN" > /dev/null 2>&1; then
-        sudo iptables -t nat -F "$TOR_CHAIN"
-    else
-        sudo iptables -t nat -N "$TOR_CHAIN"
+    local rules
+    rules=$(sudo iptables -t nat -S) || return 1
+    if grep -q -- "^-N $TOR_CHAIN$" <<< "$rules"; then
+        echo 'Existing Tor chain has no managed session; refusing to overwrite it.' >&2
+        return 1
+    fi
+    sudo iptables -t nat -N "$TOR_CHAIN" || return 1
+    if ! (umask 077; : > "$IPTABLES_RULES_FILE"); then
+        sudo iptables -t nat -X "$TOR_CHAIN"
+        return 1
     fi
 
     # Traffic generated by the tor process itself must bypass the redirect.
     # Must stay the first rule in the chain, evaluated before the REDIRECTs.
-    sudo iptables -t nat -A "$TOR_CHAIN" -m owner --uid-owner "$tor_uid" -j RETURN
+    sudo iptables -t nat -A "$TOR_CHAIN" -m owner --uid-owner "$tor_uid" -j RETURN || return 1
 
     # Redirect TCP SYN traffic to Tor's TransPort
-    sudo iptables -t nat -A "$TOR_CHAIN" -p tcp --syn -j REDIRECT --to-ports "$trans_port"
+    sudo iptables -t nat -A "$TOR_CHAIN" -p tcp --syn -j REDIRECT --to-ports "$trans_port" || return 1
 
     # Redirect DNS (UDP/53) to Tor's DNSPort
     # NOTE: other UDP traffic (not DNS) is NOT routed through Tor and leaks
     # outside the tunnel. This is a known Tor limitation (no UDP transparent
     # proxying support beyond DNS) - documented in README/help as well.
-    sudo iptables -t nat -A "$TOR_CHAIN" -p udp --dport 53 -j REDIRECT --to-ports "$dns_port"
+    sudo iptables -t nat -A "$TOR_CHAIN" -p udp --dport 53 -j REDIRECT --to-ports "$dns_port" || return 1
 
-    # Jump from OUTPUT into our isolated chain, inserted first so it is
-    # evaluated before the user's own OUTPUT rules but contained entirely
-    # within VPNGATE_TOR. Drain any leftover jump first to avoid duplicate
-    # inserts if a previous teardown was incomplete (M1).
-    while sudo iptables -t nat -D OUTPUT -j "$TOR_CHAIN" 2>/dev/null; do :; done
-    sudo iptables -t nat -I OUTPUT 1 -j "$TOR_CHAIN"
-
-    # Save what we need for a clean teardown later
-    cat > "$IPTABLES_RULES_FILE" <<EOF
-TOR_UID=${tor_uid}
-TOR_CHAIN=${TOR_CHAIN}
-EOF
+    sudo iptables -t nat -I OUTPUT 1 -j "$TOR_CHAIN" || return 1
 
     echo -e "${GREEN}✅ iptables rules applied (chain ${TOR_CHAIN})${NC}"
     return 0
+}
+
+
+function verify_tor_transparent() {
+    local response
+    response=$(curl --fail --silent --show-error --max-time 15 --noproxy '*' https://check.torproject.org/api/ip) || return 1
+    printf '%s' "$response" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("IsTor") is True else 1)' || return 1
+    echo 'Transparent DNS/TCP path verified by Tor Project (IsTor: true).'
 }
 
 function verify_tor_exit_ip() {
@@ -874,7 +907,7 @@ function verify_tor_exit_ip() {
     local socks_port="$1"
 
     local response
-    response=$(curl -s --max-time 10 --socks5-hostname "127.0.0.1:${socks_port}" "https://check.torproject.org/api/ip" 2>/dev/null)
+    response=$(curl -s --max-time 10 --noproxy '' --socks5-hostname "127.0.0.1:${socks_port}" "https://check.torproject.org/api/ip" 2>/dev/null)
 
     if [ -z "$response" ]; then
         echo -e "${YELLOW}⚠️  Unable to verify the Tor exit IP (non-fatal)${NC}"
@@ -899,45 +932,120 @@ function verify_tor_exit_ip() {
     return 0
 }
 
-function stop_tor() {
-    echo ""
-    echo -e "${YELLOW}🛑 Stopping Tor mode...${NC}"
-
-    # Remove the OUTPUT jump and flush/delete the isolated chain.
-    # Never touch any other iptables rule. All operations target the `nat`
-    # table (see apply_tor_iptables) and run in teardown order: jump first,
-    # then flush, then delete the chain. The jump is removed in a loop to
-    # drain any duplicate inserts left over from an incomplete prior run (M1).
-    if [ -f "$IPTABLES_RULES_FILE" ]; then
-        while sudo iptables -t nat -D OUTPUT -j "$TOR_CHAIN" 2>/dev/null; do :; done
-        sudo iptables -t nat -F "$TOR_CHAIN" > /dev/null 2>&1
-        sudo iptables -t nat -X "$TOR_CHAIN" > /dev/null 2>&1
-    fi
-
-    # Kill the tor daemon via its own PID file ONLY. Unlike OpenVPN, we
-    # deliberately do NOT fall back to a generic `pkill tor`: many distros
-    # run a system-wide Tor service (e.g. /etc/tor/torrc, user debian-tor)
-    # independently of this script, and a blind pkill would kill it too.
-    if [ -f "$TOR_PID_FILE" ]; then
-        local tor_pid=$(cat "$TOR_PID_FILE")
-        if [ -n "$tor_pid" ] && ps -p "$tor_pid" > /dev/null 2>&1; then
-            sudo kill -TERM "$tor_pid" 2>/dev/null
-            sleep 2
-            sudo kill -9 "$tor_pid" 2>/dev/null
-        fi
-    fi
-
-    echo -e "${CYAN}🔧 Re-enabling IPv6...${NC}"
-    sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null
-    sudo sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null
-    sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null
-
-    rm -f "$TORRC_FILE" "$TOR_PID_FILE" "$TOR_LOG_FILE" "$IPTABLES_RULES_FILE" "$ACTIVE_MODE_FILE"
-
-    echo -e "${GREEN}✅ Tor mode stopped cleanly${NC}"
+# IPv6 and DNS settings are recovery records, not disposable cache files.
+function tor_save_ipv6() {
+    local iface value
+    [ ! -e "$DATA_DIR/tor-ipv6.state" ] || { echo 'Unrestored Tor IPv6 state; run stop first.' >&2; return 1; }
+    local snapshot=''
+    local path
+    for path in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+        iface="${path%/disable_ipv6}"
+        iface="${iface##*/}"
+        value=$(sysctl -n "net/ipv6/conf/$iface/disable_ipv6") || return 1
+        [[ "$value" =~ ^[01]$ ]] || return 1
+        snapshot+="$iface $value"$'\n'
+    done
+    (umask 077; printf '%s' "$snapshot" > "$DATA_DIR/tor-ipv6.state") || return 1
+    for iface in all default lo; do
+        sudo sysctl -w "net/ipv6/conf/$iface/disable_ipv6=1" >/dev/null || return 1
+        [ "$(sysctl -n "net/ipv6/conf/$iface/disable_ipv6")" = 1 ] || { echo 'Could not disable IPv6; refusing Tor startup.' >&2; return 1; }
+    done
 }
 
-function start_tor() {
+function tor_restore_ipv6() {
+    [ -f "$DATA_DIR/tor-ipv6.state" ] || return 0
+    local iface value failed=0
+    while read -r iface value; do
+        if [[ "$iface" =~ ^[A-Za-z0-9_.:-]+$ ]] && [[ "$value" =~ ^[01]$ ]]; then
+            if [ -e "/proc/sys/net/ipv6/conf/$iface/disable_ipv6" ]; then
+                sudo sysctl -w "net/ipv6/conf/$iface/disable_ipv6=$value" >/dev/null || failed=1
+                [ "$(sysctl -n "net/ipv6/conf/$iface/disable_ipv6")" = "$value" ] || failed=1
+            fi
+        else
+            failed=1
+        fi
+    done < "$DATA_DIR/tor-ipv6.state"
+    [ "$failed" = 0 ] || return 1
+    rm -f "$DATA_DIR/tor-ipv6.state"
+}
+
+function tor_runtime_paths() {
+    [ -f "$DATA_DIR/tor-runtime" ] || return 0
+    local runtime
+    runtime=$(cat "$DATA_DIR/tor-runtime")
+    [[ "$runtime" =~ ^/tmp/vpngate-tor\.[A-Za-z0-9]{6}$ ]] && [ -d "$runtime" ] && [ ! -L "$runtime" ] || {
+        echo 'Invalid Tor runtime recovery path; inspect tor-runtime before retrying.' >&2; return 1;
+    }
+    TORRC_FILE="$runtime/torrc"
+    TOR_PID_FILE="$runtime/tor.pid"
+    TOR_LOG_FILE="$runtime/tor.log"
+}
+
+function tor_create_runtime() {
+    # The owner exemption in the firewall must never exempt root or the login
+    # user's traffic. Use the distribution's dedicated Tor account instead.
+    local account uid runtime
+    for account in debian-tor toranon _tor tor; do
+        uid=$(id -u "$account" 2>/dev/null) || continue
+        [ "$uid" != 0 ] && [ "$uid" != "$(id -u)" ] && break
+        uid=''
+    done
+    [ -n "$uid" ] || { echo 'A dedicated non-root Tor service account is required; install your distribution Tor package.' >&2; return 1; }
+    runtime=$(mktemp -d /tmp/vpngate-tor.XXXXXX) || return 1
+    # Config and log paths remain outside a potentially private home directory.
+    chmod 755 "$runtime" || return 1
+    sudo chown "$account" "$runtime" || { rmdir "$runtime"; return 1; }
+    printf '%s\n' "$runtime" > "$DATA_DIR/tor-runtime" || return 1
+    TOR_DAEMON_USER="$account"
+    tor_runtime_paths
+}
+
+function stop_tor() {
+    local failed=0
+    tor_runtime_paths || return 1
+    if [ -e "$IPTABLES_RULES_FILE" ]; then
+        local rules
+        if rules=$(sudo iptables -t nat -S); then
+            if grep -q -- "^-N $TOR_CHAIN$" <<< "$rules"; then
+                while grep -q -- "^-A OUTPUT -j $TOR_CHAIN$" <<< "$rules"; do
+                    sudo iptables -t nat -D OUTPUT -j "$TOR_CHAIN" || { failed=1; break; }
+                    rules=$(sudo iptables -t nat -S) || { failed=1; break; }
+                done
+                sudo iptables -t nat -F "$TOR_CHAIN" || failed=1
+                sudo iptables -t nat -X "$TOR_CHAIN" || failed=1
+            fi
+        else
+            failed=1
+        fi
+    fi
+    [ "$failed" = 0 ] || { echo 'Firewall cleanup failed; Tor and recovery settings retained. Retry stop.' >&2; return 1; }
+    if [ -f "$TOR_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$TOR_PID_FILE")
+        if tor_pid_matches "$pid"; then
+            sudo kill -TERM "$pid" || failed=1
+            local waited
+            for waited in 1 2 3 4 5; do
+                sudo kill -0 "$pid" 2>/dev/null || break
+                sleep 1
+            done
+            # Recheck process identity before escalation (PID reuse).
+            if tor_pid_matches "$pid"; then sudo kill -KILL "$pid" || failed=1; fi
+        fi
+    fi
+    sudo python3 "$SCRIPT_DIR/tor-dns.py" restore "$DATA_DIR/tor-dns.json" || failed=1
+    tor_restore_ipv6 || failed=1
+    [ "$failed" = 0 ] || { echo "Tor cleanup incomplete; run '$0 stop' to retry. Recovery state retained." >&2; return 1; }
+    if [ -f "$DATA_DIR/tor-runtime" ]; then
+        local runtime
+        runtime=$(cat "$DATA_DIR/tor-runtime")
+        sudo rm -rf -- "$runtime" || return 1
+    fi
+    rm -f "$DATA_DIR/tor-runtime" "$DATA_DIR/tor.pid" "$IPTABLES_RULES_FILE" "$ACTIVE_MODE_FILE"
+    echo 'Tor stopped; previous DNS and IPv6 settings restored.'
+}
+
+function start_tor() (
     local country_code="$1"
     local mode="${2:-daemon}"
 
@@ -956,6 +1064,9 @@ function start_tor() {
         echo -e "${RED}❌ Invalid country code: expected a 2-letter ISO code (e.g. US, FR, JP)${NC}"
         return 1
     fi
+
+    exec 8>"$DATA_DIR/tor.lock"
+    flock -n 8 || { echo 'Another Tor operation is running.' >&2; return 1; }
 
     # --- Environment validation (must run before any system action) ---
 
@@ -991,12 +1102,12 @@ function start_tor() {
     fi
 
     # OpenVPN and Tor mode are mutually exclusive
-    if pgrep -x openvpn > /dev/null; then
+    if is_our_openvpn_running; then
         echo -e "${YELLOW}⚠️  OpenVPN is currently active${NC}"
         echo -e "${YELLOW}Do you want to stop it and start Tor mode instead? (y/N)${NC} "
         read -r response
         if [[ "$response" =~ ^[yY]$ ]]; then
-            cleanup
+            cleanup || return 1
             sleep 2
         else
             echo "Cancelled."
@@ -1009,7 +1120,7 @@ function start_tor() {
         echo -e "${YELLOW}Do you want to restart it with the new country? (y/N)${NC} "
         read -r response
         if [[ "$response" =~ ^[yY]$ ]]; then
-            stop_tor
+            stop_tor || return 1
             sleep 1
         else
             echo "Cancelled."
@@ -1019,27 +1130,25 @@ function start_tor() {
 
     # --- Config + daemon startup ---
 
-    # Disable IPv6 before any tor/network activity starts. The transparent
-    # proxy rules in apply_tor_iptables() only cover the IPv4 `nat` table, so
-    # any IPv6 traffic would bypass Tor entirely and leak the real address.
-    # Done here (after the confirmation prompts) so an aborted start never
-    # toggles IPv6; re-enabled in stop_tor().
-    echo -e "${CYAN}🔧 Temporarily disabling IPv6...${NC}"
-    sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
-    sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
-    sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null
+    [ -f "$SCRIPT_DIR/tor-dns.py" ] || { echo 'Missing tor-dns.py; reinstall VPNGate Manager.' >&2; return 1; }
+    if [ -e "$DATA_DIR/tor-runtime" ] || [ -e "$DATA_DIR/tor-ipv6.state" ] || [ -e "$DATA_DIR/tor-dns.json" ]; then
+        echo 'Tor recovery state exists; run stop before starting again.' >&2; return 1
+    fi
+    check_tor_ports_free "$TOR_SOCKS_PORT" "$TOR_TRANS_PORT" "$TOR_DNS_PORT" || return 1
+    echo tor > "$ACTIVE_MODE_FILE"
+    trap 'stop_tor' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    tor_create_runtime || return 1
+    tor_save_ipv6 || return 1
 
     echo -e "${CYAN}🔧 Generating Tor configuration for exit country '${country_upper}'...${NC}"
-    generate_torrc "$country_upper" "$TOR_SOCKS_PORT"
+    generate_torrc "$country_upper" "$TOR_SOCKS_PORT" || return 1
 
     rm -f "$TOR_LOG_FILE" "$TOR_PID_FILE"
 
-    if ! check_tor_ports_free "$TOR_SOCKS_PORT" "$TOR_TRANS_PORT" "$TOR_DNS_PORT"; then
-        return 1
-    fi
-
     echo -e "${GREEN}🚀 Starting Tor daemon...${NC}"
-    sudo tor -f "$TORRC_FILE" --pidfile "$TOR_PID_FILE" --runasdaemon 1
+    sudo tor -f "$TORRC_FILE" --User "$TOR_DAEMON_USER" --DataDirectory "$(dirname "$TORRC_FILE")/data" --pidfile "$TOR_PID_FILE" --runasdaemon 1 8>&-
 
     if [ $? -ne 0 ] || [ ! -f "$TOR_PID_FILE" ]; then
         echo -e "${RED}❌ Tor failed to launch${NC}"
@@ -1087,6 +1196,8 @@ function start_tor() {
 
     # --- Transparent proxy iptables rules ---
 
+    sudo python3 "$SCRIPT_DIR/tor-dns.py" prepare "$DATA_DIR/tor-dns.json" || return 1
+
     local tor_pid
     tor_pid=$(cat "$TOR_PID_FILE")
 
@@ -1098,7 +1209,10 @@ function start_tor() {
 
     # --- Exit IP verification (non-fatal) ---
 
-    verify_tor_exit_ip "$TOR_SOCKS_PORT"
+    if ! verify_tor_transparent; then
+        echo 'Transparent Tor DNS/TCP verification failed; rolling back.' >&2
+        return 1
+    fi
 
     echo ""
     echo -e "${YELLOW}⚠️  Only TCP and DNS traffic are routed through Tor. Other UDP traffic leaks outside the tunnel.${NC}"
@@ -1107,13 +1221,20 @@ function start_tor() {
     echo -e "   ${GREEN}$0 stop${NC}    - Stop Tor mode"
 
     if [ "$mode" = "foreground" ]; then
-        trap cleanup EXIT INT TERM
+        exec 8>&-
         echo -e "${YELLOW}   Press Ctrl+C to stop${NC}"
-        tail -f "$TOR_LOG_FILE"
+        tail -f "$TOR_LOG_FILE" &
+        local tail_pid=$!
+        trap 'kill "$tail_pid" 2>/dev/null || :; stop_vpn' EXIT
+        while tor_pid_matches "$tor_pid"; do sleep 1; done
+        kill "$tail_pid" 2>/dev/null || :
+        wait "$tail_pid" 2>/dev/null || :
+    else
+        trap - EXIT INT TERM
     fi
 
     return 0
-}
+)
 
 # ---------------------------------------------------------------------------
 # Netns-isolated VPN mode (host routing table is never touched)
@@ -1331,13 +1452,15 @@ function netns_stop() (
     echo "Namespace '$ns' stopped"
 )
 
-function stop_vpn() {
-    if ! pgrep -x openvpn > /dev/null && ! is_our_tor_running; then
-        echo -e "${YELLOW}No active VPN${NC}"
-        return 0
+function stop_vpn() (
+    exec 8>"$DATA_DIR/tor.lock"
+    flock -n 8 || { echo 'Another Tor operation is running.' >&2; return 1; }
+    if [ "$(cat "$ACTIVE_MODE_FILE" 2>/dev/null)" = tor ] || [ -e "$DATA_DIR/tor-runtime" ] || [ -e "$DATA_DIR/tor-ipv6.state" ] || [ -e "$DATA_DIR/tor-dns.json" ]; then
+        stop_tor
+    else
+        cleanup
     fi
-    cleanup
-}
+)
 
 function show_help() {
     echo -e "${CYAN}VPNGate Manager - VPN Manager${NC}\n"
@@ -1345,12 +1468,12 @@ function show_help() {
     echo "  $0 [command] [options]"
     echo ""
     echo -e "${YELLOW}Commands:${NC}"
-    echo -e "  ${GREEN}start [country] [-f]${NC}  Connect to a VPN"
+    echo -e "  ${GREEN}start [country] [--auto] [-f]${NC}  Connect to a VPN"
     echo "                        - Without argument: show all available VPN servers"
     echo "                        - With country: filter by country (e.g. japan, france, US)"
     echo -e "                        - ${CYAN}-f${NC} : foreground mode (shows logs)"
     echo ""
-    echo -e "  ${GREEN}local [-f]${NC}            Use a local .ovpn file"
+    echo -e "  ${GREEN}local [--file PATH] [-f]${NC}            Use a local .ovpn file"
     echo -e "                        - ${CYAN}-f${NC} : foreground mode"
     echo ""
     echo -e "  ${GREEN}tor <country_code> [-f]${NC}  Route traffic through a Tor exit node in <country_code>"
@@ -1365,7 +1488,7 @@ function show_help() {
     echo ""
     echo -e "  ${GREEN}netns-start [country] [ns=tennis-vpn] [n=1]${NC}"
     echo "                        Start a VPN fully isolated in a network namespace"
-    echo "                        - Host routing table / default IP are never touched"
+    echo "                        - Existing host routes/default IP are preserved; adds a temporary /30 link"
     echo "                        - Exposes a SOCKS5 proxy reachable from the host"
     echo "                        - For scripts/agents/timers; never changes the user's own connectivity"
     echo -e "  ${GREEN}netns-status [ns=tennis-vpn]${NC}  Show proxy URL + exit IP"
@@ -1383,6 +1506,10 @@ function show_help() {
     echo "                        - Server is picked automatically (non-interactive)"
     echo -e "                        - Requires: ${CYAN}vopono${NC} (https://github.com/jamesmcm/vopono)"
     echo ""
+    echo '  dns benchmark|status|enable|restore  Optional Cloudflare DNS (no tunnel)'
+    echo '  purge                 Remove inactive cache/config/log artifacts'
+    echo '  VPNGATE_DATA_DIR=/absolute/path  Override the data/config directory'
+    echo ''
     echo -e "  ${GREEN}help${NC}                  Show this help"
     echo ""
     echo -e "${YELLOW}Operating modes:${NC}"
@@ -1406,28 +1533,102 @@ function show_help() {
     echo ""
 }
 
+# Explicit non-interactive selection; automated jobs should prefer netns-start.
+function start_command() {
+    local auto=0 country='' mode=daemon arg
+    for arg in "$@"; do
+        case "$arg" in
+            --auto) auto=1 ;;
+            -f) mode=foreground ;;
+            -*) echo "Unknown start option: $arg" >&2; return 1 ;;
+            *) [ -z "$country" ] || { echo 'Only one country is allowed' >&2; return 1; }; country="$arg" ;;
+        esac
+    done
+    if [ "$auto" = 1 ]; then
+        local config
+        config=$(resolve_ovpn_for_exec "$country") || return 1
+        [ -n "$config" ] || return 1
+        start_vpn "$config" "$mode"
+    else
+        [ -t 0 ] || { echo 'Interactive selection needs a terminal; use start --auto or netns-start.' >&2; return 1; }
+        select_vpn "$country" "$mode"
+    fi
+}
+
+function local_command() {
+    local file='' mode=daemon
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --file) [ "$#" -ge 2 ] || { echo '--file requires a path' >&2; return 1; }; file="$2"; shift ;;
+            -f) mode=foreground ;;
+            *) echo "Unknown local option: $1" >&2; return 1 ;;
+        esac
+        shift
+    done
+    if [ -n "$file" ]; then
+        start_vpn "$file" "$mode"
+    else
+        [ -t 0 ] || { echo 'Interactive selection needs a terminal; use local --file PATH.' >&2; return 1; }
+        list_local_vpns "$mode"
+    fi
+}
+
+function purge_artifacts() {
+    # Restoration records are deliberately never purged: losing them can leave
+    # DNS, forwarding or IPv6 settings modified after a crashed session.
+    local state
+    for state in "$ACTIVE_MODE_FILE" "$PID_FILE" "$TOR_PID_FILE" \
+        "$DATA_DIR/tor-ipv6.state" "$DATA_DIR/tor-dns.json" \
+        "$DATA_DIR/tor-runtime" "$DATA_DIR/cloudflare-dns.json" \
+        /var/lib/vpngate-manager/cloudflare-dns/state.json; do
+        if [ -e "$state" ] || [ -L "$state" ]; then
+            echo "Refusing purge: session/recovery state exists ($state). Run stop/dns restore first." >&2
+            return 1
+        fi
+    done
+    if [ -d "$DATA_DIR/netns" ] && [ -n "$(find "$DATA_DIR/netns" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]; then
+        echo 'Refusing purge: namespace recovery state exists; run netns-stop first.' >&2
+        return 1
+    fi
+    find "$DATA_DIR" -maxdepth 1 -type f \( -name '*.ovpn' -o -name 'vpn.log' \
+        -o -name 'tor.log' -o -name 'torrc.tmp' -o -name '.vpngate_cache.csv' \
+        -o -name '.vpngate_cache.??????' -o -name '.vpn_selection_data' \
+        -o -name '.local_vpn_list' \) -delete || return 1
+    echo 'Cached lists, downloaded configs and inactive logs removed.'
+}
+
+function dns_command() {
+    local action="${1:-status}"
+    [ "$#" -eq 0 ] || shift
+    case "$action" in
+        benchmark|status) python3 "$SCRIPT_DIR/cloudflare-dns.py" "$action" "$@" ;;
+        enable|restore)
+            if [ "$action" = enable ] && { [ -e "$ACTIVE_MODE_FILE" ] || [ -e "$TOR_PID_FILE" ] || [ -e "$PID_FILE" ]; }; then
+                echo 'Stop the host VPN/Tor session explicitly before enabling direct DNS.' >&2
+                return 1
+            fi
+            sudo python3 "$SCRIPT_DIR/cloudflare-dns.py" "$action" "$@" ;;
+        *) echo 'Usage: vpn dns benchmark|status|enable|restore [--samples N]' >&2; return 1 ;;
+    esac
+}
+
+
 # Main menu
 case "${1:-help}" in
     start)
-        # Check whether -f is provided
-        if [ "$2" = "-f" ] || [ "$3" = "-f" ]; then
-            mode="foreground"
-            country="${2}"
-            [ "$country" = "-f" ] && country=""
-        else
-            mode="daemon"
-            country="${2}"
-        fi
-        select_vpn "$country" "$mode"
+        shift
+        start_command "$@"
         ;;
     local)
-        # Check whether -f is provided
-        if [ "$2" = "-f" ]; then
-            mode="foreground"
-        else
-            mode="daemon"
-        fi
-        list_local_vpns "$mode"
+        shift
+        local_command "$@"
+        ;;
+    dns)
+        shift
+        dns_command "$@"
+        ;;
+    purge)
+        purge_artifacts
         ;;
     tor)
         # Check whether -f is provided
