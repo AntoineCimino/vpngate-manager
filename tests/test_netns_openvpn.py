@@ -27,6 +27,13 @@ class OpenVPNIntegrationTests(unittest.TestCase):
             self.skipTest('unprivileged user/network/mount namespaces unavailable')
         with tempfile.TemporaryDirectory() as temp:
             work = Path(temp)
+            # sudo CI maps host UID 0 into the user namespace; the original
+            # checkout may belong to an unmapped runner UID with private paths.
+            # Copy inputs while still privileged into this caller-owned fixture.
+            checkout = work / 'checkout'
+            checkout.mkdir()
+            for source in ('vpngate-manager.sh', 'netns-socks5.py'):
+                shutil.copyfile(ROOT / source, checkout / source)
             bindir = work / 'bin'
             bindir.mkdir()
             (bindir / 'sudo').write_text('#!/bin/sh\nexec "$@"\n')
@@ -124,7 +131,7 @@ test ! -d "$DATA_DIR/netns/smoke"
 test "$(ip netns list | cut -d' ' -f1)" = peer
 '''
             env = os.environ.copy()
-            env.update(PATH=f'{bindir}:{env["PATH"]}', WORK=temp, REPO=str(ROOT),
+            env.update(PATH=f'{bindir}:{env["PATH"]}', WORK=temp, REPO=str(checkout),
                        XDG_DATA_HOME=str(work / 'data'))
             result = subprocess.run(['unshare', '-Urnm', 'bash', '-c', script],
                                     env=env, capture_output=True, text=True, timeout=45)

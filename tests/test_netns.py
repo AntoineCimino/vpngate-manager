@@ -77,6 +77,13 @@ class NetnsKernelTests(unittest.TestCase):
             self.skipTest("unprivileged user/network/mount namespaces unavailable")
         with tempfile.TemporaryDirectory() as temp:
             work = Path(temp)
+            # sudo CI maps host UID 0 into the user namespace; the original
+            # checkout may belong to an unmapped runner UID with private paths.
+            # Copy inputs while still privileged into this caller-owned fixture.
+            checkout = work / 'checkout'
+            checkout.mkdir()
+            for source in ('vpngate-manager.sh', 'netns-socks5.py'):
+                shutil.copyfile(ROOT / source, checkout / source)
             bindir = work / "bin"
             bindir.mkdir()
             (bindir / "sudo").write_text('''#!/bin/sh
@@ -134,11 +141,19 @@ trap 'kill "$unrelated" 2>/dev/null || true' EXIT
 netns_start '' smoke
 ip netns exec smoke iptables -C OUTPUT -o tun0 -j ACCEPT
 ip netns exec smoke iptables -S OUTPUT | grep -- '-P OUTPUT DROP'
-python3 -m http.server 18080 --bind 0.0.0.0 > "$WORK/http.log" 2>&1 &
+# HTTPServer normally reverse-resolves its bind address; this fixture has no
+# external DNS, so use a fixed server name instead of a network-dependent bind.
+python3 -u -c 'import http.server, socket; socket.getfqdn = lambda name: "fixture"; http.server.HTTPServer(("0.0.0.0", 18080), http.server.SimpleHTTPRequestHandler).serve_forever()' > "$WORK/http.log" 2>&1 &
 server=$!
 trap 'kill "$unrelated" "$server" 2>/dev/null || true' EXIT
-sleep 0.2
-curl --fail --silent --max-time 2 --noproxy '*' http://10.200.200.1:18080/ >/dev/null
+# Wait for the HTTP listener rather than assuming a fixed startup duration.
+ready=0
+for attempt in $(seq 1 20); do
+ if curl --fail --silent --max-time 1 --noproxy '*' http://10.200.200.1:18080/ >/dev/null; then ready=1; break; fi
+ if ! kill -0 "$server" 2>/dev/null; then cat "$WORK/http.log"; exit 22; fi
+ sleep 0.1
+done
+if [ "$ready" != 1 ]; then cat "$WORK/http.log"; exit 23; fi
 # The same reachable server must be inaccessible through the proxy, even while tun0 exists.
 if curl --silent --max-time 2 --noproxy '' --socks5-hostname 10.200.200.2:1080 http://10.200.200.1:18080/; then exit 9; fi
 ip netns exec smoke ip link del tun0
@@ -206,7 +221,7 @@ ip netns list | grep '^foreign'
 ip netns del foreign
 '''
             env = os.environ.copy()
-            env.update(PATH=f"{bindir}:{env['PATH']}", WORK=temp, REPO=str(ROOT),
+            env.update(PATH=f"{bindir}:{env['PATH']}", WORK=temp, REPO=str(checkout),
                        XDG_DATA_HOME=str(work / "data"))
             result = subprocess.run(["unshare", "-Urnm", "bash", "-c", script],
                                     env=env, capture_output=True, text=True, timeout=35)

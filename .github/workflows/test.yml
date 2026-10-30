@@ -6,13 +6,13 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python: ['3.10', '3.13']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - name: Check Bash syntax
@@ -20,9 +20,9 @@ jobs:
       - name: Run regression tests
         run: python -m unittest discover -s tests -v
   kernel-integration:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install integration prerequisites
         run: |
           sudo apt-get update -qq
