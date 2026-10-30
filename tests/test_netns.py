@@ -119,6 +119,18 @@ echo 'Initialization Sequence Completed' > "$log"
             for executable in bindir.iterdir():
                 executable.chmod(0o755)
             (work / "vpn.ovpn").write_text("client\nremote 198.51.100.1 1194\n")
+            (work / 'http-fixture.py').write_text('''import http.server
+import socket
+socket.getfqdn = lambda name: 'fixture'
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'fixture ready'
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+http.server.HTTPServer(('0.0.0.0', 18080), Handler).serve_forever()
+''')
             script = r'''
 set -e
 mount --make-rprivate /
@@ -141,9 +153,9 @@ trap 'kill "$unrelated" 2>/dev/null || true' EXIT
 netns_start '' smoke
 ip netns exec smoke iptables -C OUTPUT -o tun0 -j ACCEPT
 ip netns exec smoke iptables -S OUTPUT | grep -- '-P OUTPUT DROP'
-# HTTPServer normally reverse-resolves its bind address; this fixture has no
-# external DNS, so use a fixed server name instead of a network-dependent bind.
-python3 -u -c 'import http.server, socket; socket.getfqdn = lambda name: "fixture"; http.server.HTTPServer(("0.0.0.0", 18080), http.server.SimpleHTTPRequestHandler).serve_forever()' > "$WORK/http.log" 2>&1 &
+# Return a literal response without resolving names or reading the original
+# working directory, which may be inaccessible after user-namespace UID mapping.
+python3 -u "$WORK/http-fixture.py" > "$WORK/http.log" 2>&1 &
 server=$!
 trap 'kill "$unrelated" "$server" 2>/dev/null || true' EXIT
 # Wait for the HTTP listener rather than assuming a fixed startup duration.
