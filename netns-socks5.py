@@ -17,33 +17,48 @@ import threading
 SOCKS_VERSION = 5
 
 
+def recv_exact(conn, count):
+    """TCP may split every byte of the SOCKS handshake across packets."""
+    data = bytearray()
+    while len(data) < count:
+        chunk = conn.recv(count - len(data))
+        if not chunk:
+            raise OSError("Truncated SOCKS handshake")
+        data.extend(chunk)
+    return bytes(data)
+
+
 def handle_client(conn):
+    remote = None
     try:
         conn.settimeout(30)
         # Greeting: VER NMETHODS METHODS
-        header = conn.recv(2)
+        header = recv_exact(conn, 2)
         if len(header) < 2 or header[0] != SOCKS_VERSION:
             return
         nmethods = header[1]
-        conn.recv(nmethods)
+        methods = recv_exact(conn, nmethods)
+        if 0 not in methods:
+            conn.sendall(b"\x05\xff")
+            return
         conn.sendall(bytes([SOCKS_VERSION, 0x00]))  # no auth required
 
         # Request: VER CMD RSV ATYP DST.ADDR DST.PORT
-        req = conn.recv(4)
+        req = recv_exact(conn, 4)
         if len(req) < 4 or req[0] != SOCKS_VERSION:
             return
         cmd, atyp = req[1], req[3]
 
         if atyp == 0x01:  # IPv4
-            addr = socket.inet_ntoa(conn.recv(4))
+            addr = socket.inet_ntoa(recv_exact(conn, 4))
         elif atyp == 0x03:  # domain name
-            length = conn.recv(1)[0]
-            addr = conn.recv(length).decode()
+            length = recv_exact(conn, 1)[0]
+            addr = recv_exact(conn, length).decode("ascii")
         elif atyp == 0x04:  # IPv6
-            addr = socket.inet_ntop(socket.AF_INET6, conn.recv(16))
+            addr = socket.inet_ntop(socket.AF_INET6, recv_exact(conn, 16))
         else:
             return
-        port = struct.unpack(">H", conn.recv(2))[0]
+        port = struct.unpack(">H", recv_exact(conn, 2))[0]
 
         if cmd != 0x01:  # only CONNECT supported
             conn.sendall(bytes([SOCKS_VERSION, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]))
@@ -56,7 +71,8 @@ def handle_client(conn):
             return
 
         bind_ip, bind_port = remote.getsockname()[:2]
-        reply = bytes([SOCKS_VERSION, 0x00, 0x00, 0x01]) + socket.inet_aton(bind_ip) \
+        atyp = 0x01 if remote.family == socket.AF_INET else 0x04
+        reply = bytes([SOCKS_VERSION, 0x00, 0x00, atyp]) + socket.inet_pton(remote.family, bind_ip) \
             + struct.pack(">H", bind_port)
         conn.sendall(reply)
 
@@ -64,6 +80,8 @@ def handle_client(conn):
     except (OSError, socket.timeout, IndexError, UnicodeDecodeError):
         pass
     finally:
+        if remote is not None:
+            remote.close()
         conn.close()
 
 

@@ -535,10 +535,8 @@ function cleanup_openvpn() {
         rm -f "$PID_FILE"
     fi
 
-    # Kill all openvpn processes just in case
-    sudo pkill -TERM openvpn 2>/dev/null
-    sleep 1
-    sudo pkill -9 openvpn 2>/dev/null
+    # Only the recorded host VPN PID belongs to this session. Namespace and
+    # independently managed OpenVPN processes must remain untouched.
 
     echo -e "${CYAN}🔧 Re-enabling IPv6...${NC}"
     sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null
@@ -1120,229 +1118,218 @@ function start_tor() {
 # ---------------------------------------------------------------------------
 # Netns-isolated VPN mode (host routing table is never touched)
 # ---------------------------------------------------------------------------
-# ponytail: single flat /30 veth link per ns (host 10.200.200.1, ns
-# 10.200.200.2) — good enough for one scraper-facing ns at a time; if
-# multiple concurrent namespaces are ever needed, allocate distinct /30s
-# per ns instead of reusing this one.
+# One namespace at a time: the dedicated /30 adds only a connected host route.
 NETNS_SUBNET_HOST="10.200.200.1"
 NETNS_SUBNET_NS="10.200.200.2"
 NETNS_SOCKS_PORT=1080
 
+function netns_valid_name() { [[ "$1" =~ ^[A-Za-z0-9_-]{1,48}$ ]]; }
 function netns_iface_names() {
-    # veth names are capped at 15 chars by the kernel; derive short,
-    # deterministic names from the ns name so multiple ns's don't collide.
-    local ns="$1"
     local h
-    h=$(echo -n "$ns" | md5sum | cut -c1-6)
+    h=$(printf '%s' "$1" | md5sum | cut -c1-6)
     echo "vgh-${h}" "vgc-${h}"
 }
-
-function netns_chain_name() {
-    local ns="$1"
-    echo "VPNGATE_NETNS_$(echo -n "$ns" | md5sum | cut -c1-8)"
-}
-
-function netns_dir() {
-    local ns="$1"
-    echo "$DATA_DIR/netns/${ns}"
-}
-
+function netns_chain_name() { printf 'VPNGATE_NETNS_%s\n' "$(printf '%s' "$1" | md5sum | cut -c1-8)"; }
+function netns_dir() { printf '%s/netns/%s\n' "$DATA_DIR" "$1"; }
+function netns_exists() { sudo ip netns list | awk -v ns="$1" '$1 == ns {found=1} END {exit !found}'; }
 function netns_uplink_iface() {
-    ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1
+    ip -4 route show default | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
 }
-
-function netns_start() {
-    local filter="$1"
-    local ns="${2:-tennis-vpn}"
-    local index="${3:-1}"
-    if [[ ! "$index" =~ ^[1-9][0-9]*$ ]]; then
-        echo -e "${RED}❌ Invalid server index: expected a positive integer${NC}"
-        return 1
+function netns_subnet_available() {
+    local routes
+    routes=$(ip -j -4 route show table all) || return 1
+    python3 -c 'import ipaddress, json, sys
+subnet = ipaddress.ip_network("10.200.200.0/30")
+for route in json.load(sys.stdin):
+    destination = route.get("dst", "default")
+    if destination == "default":
+        continue
+    network = ipaddress.ip_network(destination, strict=False)
+    if network.prefixlen and network.overlaps(subnet):
+        sys.exit(1)
+' <<< "$routes"
+}
+function netns_start() (
+    local filter="$1" ns="${2:-tennis-vpn}" index="${3:-1}"
+    netns_valid_name "$ns" && [[ "$index" =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid namespace name or server index' >&2; return 1; }
+    local tool
+    for tool in ip iptables openvpn python3 flock; do
+        command -v "$tool" >/dev/null || { echo "Missing dependency: $tool" >&2; return 1; }
+    done
+    [ -f "$SCRIPT_DIR/netns-socks5.py" ] || { echo 'Missing installed netns-socks5.py helper' >&2; return 1; }
+    mkdir -p "$DATA_DIR/netns"
+    exec 9>"$DATA_DIR/netns/.lock"
+    flock -n 9 || { echo 'Another namespace operation is running' >&2; return 1; }
+    # Fixed addressing intentionally supports a single managed namespace.
+    if compgen -G "$DATA_DIR/netns/*/owned" >/dev/null || netns_exists "$ns" || [ -e "/etc/netns/$ns" ]; then
+        echo 'Namespace or managed session already exists; stop it first' >&2; return 1
     fi
-
-    if [[ ! "$ns" =~ ^[A-Za-z0-9_-]+$ ]]; then
-        echo -e "${RED}❌ Invalid namespace name: expected [A-Za-z0-9_-]+${NC}"
-        return 1
+    if ! netns_subnet_available; then
+        echo 'Dedicated subnet 10.200.200.0/30 conflicts with an existing host route' >&2; return 1
     fi
-
-    if ip netns list 2>/dev/null | grep -q "^${ns}\b"; then
-        echo -e "${YELLOW}⚠️  Namespace '${ns}' already exists. Run '$0 netns-stop ${ns}' first.${NC}"
-        return 1
-    fi
-
-    if ! check_command_exists ip || ! check_command_exists python3; then
-        echo -e "${RED}❌ Requires 'ip' (iproute2) and 'python3'${NC}"
-        return 1
-    fi
-
-    echo -e "${CYAN}🔎 Resolving VPN config...${NC}"
-    local ovpn_file
-    ovpn_file=$(resolve_ovpn_for_exec "$filter" "$index")
-    if [ -z "$ovpn_file" ]; then
-        echo -e "${RED}❌ No matching VPN server found${NC}"
-        return 1
-    fi
-    echo -e "${BLUE}📁 Using: $(basename "$ovpn_file")${NC}"
-
-    local uplink
+    local ovpn_file uplink veth_h veth_c chain nsdir
+    ovpn_file=$(resolve_ovpn_for_exec "$filter" "$index") || return 1
+    [ -f "$ovpn_file" ] || return 1
     uplink=$(netns_uplink_iface)
-    if [ -z "$uplink" ]; then
-        echo -e "${RED}❌ Could not determine the host's uplink interface (no default route)${NC}"
-        return 1
-    fi
-
-    local veth_h veth_c chain nsdir
+    [ -n "$uplink" ] || { echo 'No host default uplink' >&2; return 1; }
     read -r veth_h veth_c <<< "$(netns_iface_names "$ns")"
     chain=$(netns_chain_name "$ns")
     nsdir=$(netns_dir "$ns")
-    mkdir -p "$nsdir"
-
-    echo -e "${CYAN}🔧 Creating namespace '${ns}' and veth pair (host untouched otherwise)...${NC}"
+    mkdir -p "$nsdir" || return 1
+    # Save state before the first mutation; failed and interrupted starts roll back.
+    sudo sysctl -n net.ipv4.ip_forward > "$nsdir/ip_forward" || return 1
+    printf '%s\n' "$uplink" > "$nsdir/uplink"
+    touch "$nsdir/owned"
+    trap 'netns_stop "$ns" unlocked' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     sudo ip netns add "$ns" || return 1
-    sudo ip link add "$veth_h" type veth peer name "$veth_c" netns "$ns" || { sudo ip netns del "$ns"; return 1; }
-
-    sudo ip addr add "${NETNS_SUBNET_HOST}/30" dev "$veth_h"
-    sudo ip link set "$veth_h" up
-    sudo ip netns exec "$ns" ip addr add "${NETNS_SUBNET_NS}/30" dev "$veth_c"
-    sudo ip netns exec "$ns" ip link set "$veth_c" up
-    sudo ip netns exec "$ns" ip link set lo up
-    sudo ip netns exec "$ns" ip route add default via "$NETNS_SUBNET_HOST"
-
-    echo -e "${CYAN}🔧 Scoped NAT for ${ns} (chain ${chain}, uplink ${uplink})...${NC}"
-    sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
-    sudo iptables -t nat -N "$chain" 2>/dev/null
-    sudo iptables -t nat -F "$chain"
-    sudo iptables -t nat -A "$chain" -s "${NETNS_SUBNET_NS}/30" -o "$uplink" -j MASQUERADE
-    while sudo iptables -t nat -D POSTROUTING -j "$chain" 2>/dev/null; do :; done
-    sudo iptables -t nat -A POSTROUTING -j "$chain"
-    sudo iptables -C FORWARD -s "${NETNS_SUBNET_NS}/30" -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -s "${NETNS_SUBNET_NS}/30" -j ACCEPT
-    sudo iptables -C FORWARD -d "${NETNS_SUBNET_NS}/30" -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -d "${NETNS_SUBNET_NS}/30" -j ACCEPT
-
-    echo -e "${CYAN}🔧 DNS for namespace (public resolvers, not the host's)...${NC}"
-    sudo mkdir -p "/etc/netns/${ns}"
-    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee "/etc/netns/${ns}/resolv.conf" >/dev/null
-
-    echo -e "${CYAN}🚀 Starting OpenVPN inside the namespace...${NC}"
-    local vpn_log="$nsdir/openvpn.log" vpn_pid="$nsdir/openvpn.pid"
-    rm -f "$vpn_log" "$vpn_pid"
-    sudo ip netns exec "$ns" openvpn --config "$ovpn_file" \
+    touch "$nsdir/namespace"
+    sudo ip link add "$veth_h" type veth peer name "$veth_c" netns "$ns" || return 1
+    touch "$nsdir/veth"
+    sudo ip addr add "${NETNS_SUBNET_HOST}/30" dev "$veth_h" || return 1
+    sudo ip link set "$veth_h" up || return 1
+    sudo ip netns exec "$ns" ip addr add "${NETNS_SUBNET_NS}/30" dev "$veth_c" || return 1
+    sudo ip netns exec "$ns" ip link set "$veth_c" up || return 1
+    sudo ip netns exec "$ns" ip link set lo up || return 1
+    sudo ip netns exec "$ns" ip route add default via "$NETNS_SUBNET_HOST" || return 1
+    sudo ip netns exec "$ns" sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null || return 1
+    # Fail closed: only OpenVPN's marked control socket can leave through veth.
+    # Proxy traffic and remote DNS must use tun0, even after the tunnel disappears.
+    sudo ip netns exec "$ns" iptables -P INPUT DROP || return 1
+    sudo ip netns exec "$ns" iptables -A INPUT -i lo -j ACCEPT || return 1
+    sudo ip netns exec "$ns" iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
+    sudo ip netns exec "$ns" iptables -A INPUT -i "$veth_c" -s "$NETNS_SUBNET_HOST" -p tcp --dport "$NETNS_SOCKS_PORT" -j ACCEPT || return 1
+    sudo ip netns exec "$ns" iptables -P OUTPUT DROP || return 1
+    sudo ip netns exec "$ns" iptables -A OUTPUT -o lo -j ACCEPT || return 1
+    sudo ip netns exec "$ns" iptables -A OUTPUT -o tun0 -j ACCEPT || return 1
+    sudo ip netns exec "$ns" iptables -A OUTPUT -o "$veth_c" -m mark --mark 51820 -j ACCEPT || return 1
+    sudo ip netns exec "$ns" iptables -A OUTPUT -o "$veth_c" -d "$NETNS_SUBNET_HOST" -p tcp --sport "$NETNS_SOCKS_PORT" -m conntrack --ctstate ESTABLISHED -j ACCEPT || return 1
+    sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null || return 1
+    touch "$nsdir/forwarding"
+    sudo iptables -t nat -N "$chain" || return 1
+    touch "$nsdir/chain"
+    sudo iptables -t nat -A "$chain" -s "${NETNS_SUBNET_NS}/32" -o "$uplink" -j MASQUERADE || return 1
+    sudo iptables -t nat -A POSTROUTING -j "$chain" || return 1
+    sudo iptables -I FORWARD -i "$veth_h" -o "$uplink" -s "${NETNS_SUBNET_NS}/32" -m comment --comment "$chain" -j ACCEPT || return 1
+    touch "$nsdir/outgoing"
+    sudo iptables -I FORWARD -i "$uplink" -o "$veth_h" -d "${NETNS_SUBNET_NS}/32" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$chain" -j ACCEPT || return 1
+    touch "$nsdir/incoming"
+    sudo mkdir "/etc/netns/$ns" || return 1
+    touch "$nsdir/dns"
+    printf 'nameserver 1.1.1.1\nnameserver 1.0.0.1\n' | sudo tee "/etc/netns/$ns/resolv.conf" >/dev/null || return 1
+    # VPNGate profiles use numeric remotes. Refuse hostnames rather than opening
+    # a DNS bypass before the VPN has connected.
+    if ! awk '$1 == "remote" {if ($2 !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) bad=1; count++} END {exit bad || !count}' "$ovpn_file"; then
+        echo 'Namespace mode requires numeric IPv4 OpenVPN remote addresses' >&2; return 1
+    fi
+    local vpn_log="$nsdir/openvpn.log"
+    sudo ip netns exec "$ns" openvpn --config "$ovpn_file" --dev tun0 --redirect-gateway def1 --mark 51820 \
         --data-ciphers AES-128-CBC:AES-256-CBC:AES-128-GCM:AES-256-GCM \
-        --daemon --log "$vpn_log" --writepid "$vpn_pid"
-
-    local waited=0 max_wait=60
-    while [ $waited -lt $max_wait ]; do
-        sleep 1
-        ((waited++))
-        if sudo ip netns exec "$ns" ip a 2>/dev/null | grep -q "tun0"; then
-            break
+        --script-security 1 --auth-retry none --daemon --log "$vpn_log" --writepid "$nsdir/openvpn.pid" 9>&- || return 1
+    local waited=0
+    while [ "$waited" -lt 60 ]; do
+        if grep -q 'AUTH_FAILED\|Exiting due to fatal error' "$vpn_log" 2>/dev/null; then
+            echo 'OpenVPN rejected the connection' >&2; return 1
         fi
-        if [ -f "$vpn_pid" ] && ! ps -p "$(cat "$vpn_pid")" > /dev/null 2>&1; then
-            echo -e "${RED}❌ OpenVPN failed to start inside namespace${NC}"
-            tail -n 10 "$vpn_log" 2>/dev/null | sed 's/^/   /'
-            netns_stop "$ns"
-            return 1
-        fi
+        if grep -q 'Initialization Sequence Completed' "$vpn_log" 2>/dev/null && sudo ip netns exec "$ns" ip link show tun0 >/dev/null 2>&1; then break; fi
+        sleep 1; waited=$((waited + 1))
     done
-    if ! sudo ip netns exec "$ns" ip a 2>/dev/null | grep -q "tun0"; then
-        echo -e "${RED}❌ OpenVPN did not come up inside namespace within ${max_wait}s${NC}"
-        tail -n 15 "$vpn_log" 2>/dev/null | sed 's/^/   /'
-        netns_stop "$ns"
-        return 1
-    fi
-
-    echo -e "${CYAN}🚀 Starting SOCKS5 proxy on ${NETNS_SUBNET_NS}:${NETNS_SOCKS_PORT}...${NC}"
-    local socks_log="$nsdir/socks5.log" socks_pid="$nsdir/socks5.pid"
-    rm -f "$socks_log" "$socks_pid"
-    sudo ip netns exec "$ns" python3 "$SCRIPT_DIR/netns-socks5.py" "$NETNS_SUBNET_NS" "$NETNS_SOCKS_PORT" \
-        > "$socks_log" 2>&1 &
-    disown
-    # daemonized via ip netns exec's own child; record via pgrep inside the ns instead
-    sleep 1
-    local socks_pid_val
-    socks_pid_val=$(sudo ip netns exec "$ns" pgrep -f "[n]etns-socks5.py" | head -n1)
-    if [ -z "$socks_pid_val" ]; then
-        echo -e "${RED}❌ SOCKS5 proxy failed to start${NC}"
-        cat "$socks_log" 2>/dev/null | sed 's/^/   /'
-        netns_stop "$ns"
-        return 1
-    fi
-    echo "$socks_pid_val" > "$socks_pid"
-
-    echo -e "${GREEN}✅ Namespace '${ns}' ready${NC}"
-    echo -e "   ${CYAN}🧦 SOCKS5 proxy: socks5://${NETNS_SUBNET_NS}:${NETNS_SOCKS_PORT}${NC}"
-    echo -e "   ${CYAN}📄 Logs: ${vpn_log} / ${socks_log}${NC}"
-    echo -e "   ${YELLOW}$0 netns-status ${ns}${NC}  - check exit IP"
-    echo -e "   ${YELLOW}$0 netns-stop ${ns}${NC}    - tear down"
-    return 0
-}
-
+    [ "$waited" -lt 60 ] || { echo 'OpenVPN connection timed out' >&2; return 1; }
+    sudo ip netns exec "$ns" python3 "$SCRIPT_DIR/netns-socks5.py" "$NETNS_SUBNET_NS" "$NETNS_SOCKS_PORT" > "$nsdir/socks5.log" 2>&1 9>&- &
+    local proxy_launcher=$!
+    # Verify an actual SOCKS5 greeting, not a process name shared by other namespaces.
+    local ready=0
+    for waited in 1 2 3 4 5; do
+        if python3 - "$NETNS_SUBNET_NS" "$NETNS_SOCKS_PORT" <<'PY'
+import socket, sys
+try:
+    with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=1) as s:
+        s.sendall(b'\x05\x01\x00')
+        if s.recv(2) != b'\x05\x00': raise OSError('Bad SOCKS greeting')
+except OSError:
+    sys.exit(1)
+PY
+        then ready=1; break; fi
+        kill -0 "$proxy_launcher" 2>/dev/null || break
+        sleep 1
+    done
+    [ "$ready" = 1 ] || { echo 'SOCKS5 proxy failed to become ready' >&2; return 1; }
+    trap - EXIT INT TERM
+    echo "Namespace '$ns' ready: socks5h://${NETNS_SUBNET_NS}:${NETNS_SOCKS_PORT}"
+)
 function netns_status() {
     local ns="${1:-tennis-vpn}"
-
-    if ! ip netns list 2>/dev/null | grep -q "^${ns}\b"; then
-        echo -e "${RED}❌ Namespace '${ns}' does not exist${NC}"
-        return 1
-    fi
-
-    echo -e "${CYAN}📊 Namespace '${ns}' status:${NC}\n"
-    echo -e "   ${CYAN}🧦 SOCKS5 proxy: socks5://${NETNS_SUBNET_NS}:${NETNS_SOCKS_PORT}${NC}"
-
-    if sudo ip netns exec "$ns" ip a 2>/dev/null | grep -q "tun0"; then
-        echo -e "   ${GREEN}✅ OpenVPN tun0 up inside namespace${NC}"
-    else
-        echo -e "   ${YELLOW}⚠️  No tun0 inside namespace${NC}"
-    fi
-
-    echo -e "   ${CYAN}🔍 Exit IP as seen through the proxy...${NC}"
-    local exit_ip
-    exit_ip=$(timeout 10 curl -s --socks5-hostname "${NETNS_SUBNET_NS}:${NETNS_SOCKS_PORT}" https://ifconfig.me 2>/dev/null)
-    if [ -n "$exit_ip" ]; then
-        echo -e "   ${GREEN}🌍 Exit IP: ${exit_ip}${NC}"
-    else
-        echo -e "   ${YELLOW}⚠️  Unable to retrieve exit IP${NC}"
-    fi
+    netns_valid_name "$ns" || return 1
+    [ -f "$(netns_dir "$ns")/owned" ] && netns_exists "$ns" || { echo 'No managed namespace session'; return 1; }
+    echo "SOCKS5 proxy: socks5h://${NETNS_SUBNET_NS}:${NETNS_SOCKS_PORT}"
+    sudo ip netns exec "$ns" ip link show tun0 >/dev/null 2>&1 || { echo 'VPN tunnel unavailable (proxy egress blocked)'; return 1; }
+    curl --fail --silent --show-error --max-time 10 --noproxy '' --socks5-hostname "${NETNS_SUBNET_NS}:${NETNS_SOCKS_PORT}" https://api.ipify.org
 }
-
-function netns_stop() {
-    local ns="${1:-tennis-vpn}"
-
-    if ! ip netns list 2>/dev/null | grep -q "^${ns}\b"; then
-        echo -e "${YELLOW}No namespace '${ns}' to stop${NC}"
-        return 0
-    fi
-
-    echo -e "${YELLOW}🛑 Stopping namespace '${ns}'...${NC}"
-
-    local nsdir
+function netns_stop() (
+    local ns="${1:-tennis-vpn}" nsdir veth_h veth_c chain uplink pid failed=0
+    netns_valid_name "$ns" || { echo 'Invalid namespace name' >&2; return 1; }
     nsdir=$(netns_dir "$ns")
-
-    # Kill proxy + openvpn from inside the namespace first (works even if
-    # our host-side pidfiles are missing/stale).
-    sudo ip netns exec "$ns" pkill -TERM -f "[n]etns-socks5.py" 2>/dev/null
-    sudo ip netns exec "$ns" pkill -TERM openvpn 2>/dev/null
-    sleep 1
-    sudo ip netns exec "$ns" pkill -9 -f "[n]etns-socks5.py" 2>/dev/null
-    sudo ip netns exec "$ns" pkill -9 openvpn 2>/dev/null
-
-    sudo ip netns del "$ns" 2>/dev/null
-
-    local veth_h veth_c chain
+    [ -f "$nsdir/owned" ] || { echo "No managed namespace '$ns' to stop"; return 0; }
+    if [ "${2:-}" != unlocked ]; then
+        exec 9>"$DATA_DIR/netns/.lock"
+        flock -n 9 || { echo 'Another namespace operation is running' >&2; return 1; }
+    fi
     read -r veth_h veth_c <<< "$(netns_iface_names "$ns")"
     chain=$(netns_chain_name "$ns")
-
-    sudo ip link del "$veth_h" 2>/dev/null
-
-    while sudo iptables -t nat -D POSTROUTING -j "$chain" 2>/dev/null; do :; done
-    sudo iptables -t nat -F "$chain" 2>/dev/null
-    sudo iptables -t nat -X "$chain" 2>/dev/null
-    sudo iptables -D FORWARD -s "${NETNS_SUBNET_NS}/30" -j ACCEPT 2>/dev/null
-    sudo iptables -D FORWARD -d "${NETNS_SUBNET_NS}/30" -j ACCEPT 2>/dev/null
-
-    sudo rm -rf "/etc/netns/${ns}"
-    rm -rf "$nsdir"
-
-    echo -e "${GREEN}✅ Namespace '${ns}' stopped, nothing left on the host${NC}"
-}
+    uplink=$(cat "$nsdir/uplink") || return 1
+    # Query failures are not evidence of absence: retain recovery state on error.
+    local namespaces links nat_rules='' forward_rules='' current_forward='' pids
+    namespaces=$(sudo ip netns list) || return 1
+    links=$(ip -o link show) || return 1
+    if [ -f "$nsdir/chain" ]; then nat_rules=$(sudo iptables -t nat -S) || return 1; fi
+    if [ -f "$nsdir/outgoing" ] || [ -f "$nsdir/incoming" ]; then
+        forward_rules=$(sudo iptables -S FORWARD) || return 1
+    fi
+    if [ -f "$nsdir/forwarding" ]; then current_forward=$(sudo sysctl -n net.ipv4.ip_forward) || return 1; fi
+    if [ -f "$nsdir/namespace" ] && awk -v ns="$ns" '$1 == ns {found=1} END {exit !found}' <<< "$namespaces"; then
+        # ip netns exec does not isolate the PID namespace. Never use pkill here.
+        pids=$(sudo ip netns pids "$ns") || return 1
+        for pid in $pids; do sudo kill -TERM "$pid" 2>/dev/null || :; done
+        sleep 1
+        pids=$(sudo ip netns pids "$ns") || return 1
+        for pid in $pids; do sudo kill -KILL "$pid" 2>/dev/null || :; done
+        sudo ip netns del "$ns" || failed=1
+    fi
+    links=$(ip -o link show) || return 1
+    if [ -f "$nsdir/veth" ] && grep -q ": ${veth_h}[:@]" <<< "$links"; then sudo ip link del "$veth_h" || failed=1; fi
+    if [ -f "$nsdir/chain" ] && grep -Fxq -- "-N $chain" <<< "$nat_rules"; then
+        if grep -Fxq -- "-A POSTROUTING -j $chain" <<< "$nat_rules"; then sudo iptables -t nat -D POSTROUTING -j "$chain" || failed=1; fi
+        sudo iptables -t nat -F "$chain" || failed=1
+        sudo iptables -t nat -X "$chain" || failed=1
+    fi
+    local rule
+    for rule in outgoing incoming; do
+        [ -f "$nsdir/$rule" ] || continue
+        local args
+        if [ "$rule" = outgoing ]; then
+            args=(-i "$veth_h" -o "$uplink" -s "${NETNS_SUBNET_NS}/32" -m comment --comment "$chain" -j ACCEPT)
+        else
+            args=(-i "$uplink" -o "$veth_h" -d "${NETNS_SUBNET_NS}/32" -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment "$chain" -j ACCEPT)
+        fi
+        local direction="-i $veth_h"
+        [ "$rule" = incoming ] && direction="-o $veth_h"
+        if grep -F -- "--comment $chain " <<< "$forward_rules" | grep -Fq -- "$direction "; then
+            sudo iptables -D FORWARD "${args[@]}" || failed=1
+        fi
+    done
+    # Restore the saved forwarding value if the session-enabled value remains.
+    if [ -f "$nsdir/forwarding" ] && [ "$current_forward" = 1 ]; then
+        sudo sysctl -w "net.ipv4.ip_forward=$(cat "$nsdir/ip_forward")" >/dev/null || failed=1
+    fi
+    if [ -f "$nsdir/dns" ]; then
+        sudo rm -f "/etc/netns/$ns/resolv.conf" || failed=1
+        if [ -d "/etc/netns/$ns" ]; then sudo rmdir "/etc/netns/$ns" || failed=1; fi
+    fi
+    [ "$failed" = 0 ] || { echo 'Cleanup incomplete; state retained for retry' >&2; return 1; }
+    rm -rf -- "$nsdir"
+    echo "Namespace '$ns' stopped"
+)
 
 function stop_vpn() {
     if ! pgrep -x openvpn > /dev/null && ! is_our_tor_running; then

@@ -18,7 +18,7 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-if [ ! -f "$SCRIPT" ]; then
+if [ ! -f "$SCRIPT" ] || [ ! -f "$SOCKS_SCRIPT" ]; then
     echo -e "${RED}❌ Run this script from inside the vpngate-manager directory${NC}"
     echo "   cd vpngate-manager && bash install.sh"
     exit 1
@@ -41,6 +41,7 @@ echo -e "${CYAN}📋 Installing vpn command to $INSTALL_PATH...${NC}"
 sudo rm -f "$INSTALL_PATH"
 sudo cp "$SCRIPT" "$INSTALL_PATH"
 sudo chmod +x "$INSTALL_PATH"
+sudo install -m 755 "$SOCKS_SCRIPT" "$(dirname "$INSTALL_PATH")/$SOCKS_SCRIPT"
 
 if [ -d "$USER_INSTALL_DIR" ]; then
     echo -e "${CYAN}📋 Re-syncing existing plain copy at $USER_INSTALL_DIR...${NC}"

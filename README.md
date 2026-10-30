@@ -118,6 +118,34 @@ from another script or program:
 ./vpngate-manager.sh exec japan -- firefox      # forced through a Japanese server
 ```
 
+### Persistent isolated VPN (`netns-start`)
+
+Use namespace mode for automation that needs a persistent SOCKS5 endpoint:
+
+```bash
+sudo vpn netns-start japan scraper-vpn 1
+curl --socks5-hostname 10.200.200.2:1080 https://api.ipify.org
+sudo vpn netns-status scraper-vpn
+sudo vpn netns-stop scraper-vpn
+```
+
+Requires Linux, iproute2, iptables, OpenVPN, Python 3, and util-linux (`flock`).
+The installer installs the proxy helper alongside `vpn`; for a manual install,
+copy `netns-socks5.py` to `/usr/local/bin/` too. Use the same user and data
+directory for start/status/stop. Only one managed namespace is supported at a
+time. The dedicated `10.200.200.0/30` link adds a connected host route while
+active; existing routes and the host default route remain unchanged. Stop
+removes the link and scoped firewall rules and restores IP forwarding.
+
+Use `--socks5-hostname` (or `socks5h://`) so DNS also travels through the VPN.
+The proxy accepts only connections from the host link and has no authentication;
+do not forward its port to other machines. Namespace egress is blocked unless
+it uses the VPN tunnel, including after tunnel failure. OpenVPN's marked control
+traffic is the only exception. Startup waits for OpenVPN initialization and a
+working SOCKS handshake; failures roll back setup. Namespace mode requires
+numeric IPv4 server addresses in the VPNGate profile. `stop` affects the host
+VPN/Tor session; use `netns-stop` to stop the isolated session.
+
 ## Tor Mode
 
 When VPNGate has no server in the region you need, `tor <country_code>` routes your traffic
