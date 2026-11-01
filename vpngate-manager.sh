@@ -809,6 +809,25 @@ function check_tor_ports_free() {
     return 0
 }
 
+function select_tor_ports() {
+    # Coexist with a distribution Tor daemon; never stop an unrelated service.
+    command -v ss >/dev/null || { echo 'Tor mode requires ss (iproute2).' >&2; return 1; }
+    local kind base offset candidate found
+    for kind in SOCKS TRANS DNS; do
+        case "$kind" in SOCKS) base=9050;; TRANS) base=9040;; DNS) base=5353;; esac
+        found=0
+        for offset in {0..9}; do
+            candidate=$((base + offset))
+            if check_tor_ports_free "$candidate" >/dev/null; then
+                printf -v "TOR_${kind}_PORT" '%s' "$candidate"
+                found=1
+                break
+            fi
+        done
+        [ "$found" = 1 ] || { echo "No free Tor $kind port in $base-$((base+9))." >&2; return 1; }
+    done
+}
+
 function generate_torrc() {
     # Note: ControlPort is intentionally omitted in this V1. It is only
     # needed to change the exit country dynamically without restarting the
@@ -979,6 +998,15 @@ function tor_runtime_paths() {
     TORRC_FILE="$runtime/torrc"
     TOR_PID_FILE="$runtime/tor.pid"
     TOR_LOG_FILE="$runtime/tor.log"
+    if [ "${1:-}" != paths-only ] && [ -f "$TORRC_FILE" ]; then
+        local kind directive port
+        for kind in SOCKS TRANS DNS; do
+            case "$kind" in SOCKS) directive=SocksPort;; TRANS) directive=TransPort;; DNS) directive=DNSPort;; esac
+            port=$(awk -v key="$directive" '$1 == key {sub(/^127\.0\.0\.1:/,"",$2); print $2; exit}' "$TORRC_FILE")
+            [[ "$port" =~ ^[0-9]{1,5}$ ]] && [ "$port" -gt 0 ] && [ "$port" -le 65535 ] || { echo 'Invalid saved Tor port configuration.' >&2; return 1; }
+            printf -v "TOR_${kind}_PORT" '%s' "$port"
+        done
+    fi
 }
 
 function tor_create_runtime() {
@@ -1002,7 +1030,7 @@ function tor_create_runtime() {
 
 function stop_tor() {
     local failed=0
-    tor_runtime_paths || return 1
+    tor_runtime_paths paths-only || return 1
     if [ -e "$IPTABLES_RULES_FILE" ]; then
         local rules
         if rules=$(sudo iptables -t nat -S); then
@@ -1134,7 +1162,7 @@ function start_tor() (
     if [ -e "$DATA_DIR/tor-runtime" ] || [ -e "$DATA_DIR/tor-ipv6.state" ] || [ -e "$DATA_DIR/tor-dns.json" ]; then
         echo 'Tor recovery state exists; run stop before starting again.' >&2; return 1
     fi
-    check_tor_ports_free "$TOR_SOCKS_PORT" "$TOR_TRANS_PORT" "$TOR_DNS_PORT" || return 1
+    select_tor_ports || return 1
     echo tor > "$ACTIVE_MODE_FILE"
     trap 'stop_tor' EXIT
     trap 'exit 130' INT

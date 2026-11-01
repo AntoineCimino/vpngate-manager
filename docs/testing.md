@@ -2,7 +2,7 @@
 
 Validated on Linux on 2026-10-30:
 
-- 80 standard-library regression tests pass, including Bash CLI selection,
+- 83 standard-library regression tests pass, including Bash CLI selection,
   installer helper delivery, Tor DNS transactions/rollback, exact IPv6 restore,
   Cloudflare DNS conflicts/recovery, and existing list/cache regressions.
 - Disposable kernel namespaces exercise real veth, routes, iptables, scoped
@@ -41,9 +41,16 @@ it runs; the original IPv4/IPv6 route tables are restored exactly on stop.
 Claiming that absolutely no route is added during operation would contradict
 this veth design. Tests cover the actual connectivity invariant explicitly.
 
-## Remaining environment checks
+## Affected-host acceptance
 
-The original host-specific MagicDNS diagnosis and WSL2 behavior still need tests
-on those actual environments. CI/local fixtures do not claim those validations.
-Do not run host-wide Tor/VPN smoke tests during connectivity-sensitive work;
-use the documented disposable containers.
+The real Tailscale-enabled host passed an additional acceptance test: ordinary
+curl and connected Chrome returned `IsTor: true`, the requested US exit was
+confirmed through Tor's relay directory, and stop restored DNS preferences,
+resolver contents, per-interface IPv6 values and the IPv4 route set. A fresh
+ordinary curl then returned `IsTor: false`. A separate Tor service on its own
+listener remained running; free-port selection avoids that conflict.
+
+One request had a transient TLS disconnect before a bounded retry succeeded.
+Public exit/checker availability remains outside deterministic regression tests.
+WSL2 behavior is not runtime-certified; its notes state Linux-kernel requirements.
+Use disposable containers for routine smoke tests to preserve host connectivity.

@@ -11,11 +11,13 @@
 - [x] VPNGATE-007: benchmark and optionally use reversible Cloudflare DNS
 - [x] VPNGATE-002: implement Tor/Tailscale DNS restoration and transparent-path checks
 
-## Validation still required
+## Validation
 
-- Reproduce the originally reported Tor/MagicDNS interaction on the affected
-  Tailscale-enabled host. Helpers and rollback have automated regression tests;
-  transparent Tor routing has a live disposable-container smoke test. A SOCKS
-  success alone does not establish that the original host-specific issue is fixed.
-- Validate WSL2 on an actual Windows host; the compatibility notes state requirements,
-  not a tested Windows release claim.
+- The original Tailscale-enabled host acceptance check passed on 2026-10-30:
+  ordinary curl and connected Chrome reported `IsTor: true`; Tor's relay
+  directory confirmed the browser exit country as US. Stop restored original
+  Tailscale DNS, resolver contents, per-interface IPv6 values and IPv4 routes.
+- The existing independent Tor service remained running: VPNGate selects free
+  listener ports and recovers those choices from its saved session config.
+- WSL2 notes describe requirements and limitations; this Linux release does not
+  claim Windows/WSL2 runtime certification.

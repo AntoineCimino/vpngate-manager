@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fail immediately on `AUTH_FAILED`, replacing the previous 60-second wait.
 - Preserve Tailscale DNS and per-interface IPv6 settings around Tor sessions;
   use a dedicated Tor account, validate the transparent path, and retain failed
-  cleanup state for recovery.
+  cleanup state for recovery. Select free listener ports to coexist with system
+  Tor services and recover saved ports for status without blocking cleanup.
 - Add optional Cloudflare DNS benchmarking and reversible NetworkManager DNS
   controls that preserve applied network configuration and reject conflicts.
 - Add `start --auto`, `local --file`, `VPNGATE_DATA_DIR`, safe `purge`, Windows

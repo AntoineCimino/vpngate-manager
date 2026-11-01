@@ -56,14 +56,25 @@ Tailscale CLI/DNS fixture also confirmed enabled → disabled → restored DNS
 preferences through that real Tor session. This fixture is not a logged-in
 Tailscale daemon. Reproduce it with the Docker command in the README.
 
-The reported target-host MagicDNS/REDIRECT hypothesis remains unconfirmed by a
-live reproduction in this development session. Validate on the affected machine
-with an explicitly started Tor session: resolve a public hostname normally,
-then request `https://check.torproject.org/api/ip` **without** a SOCKS option and
-confirm `IsTor: true`. A successful SOCKS request alone does not validate the
-transparent DNS/TCP path. Confirm the requested country with an independent
-Tor-compatible IP checker and verify the original DNS preference after stop.
-Tor still does not transparently proxy arbitrary UDP traffic.
+The original affected-host acceptance check also passed on 2026-10-30 with
+Tailscale DNS enabled before the test. Both ordinary curl and the connected
+Chrome browser reported `IsTor: true`, and Tor's public relay directory
+confirmed the browser exit was in the requested US country. Startup temporarily
+released Tailscale DNS; stop restored the original DNS preference, resolver file,
+every captured IPv6 setting and the IPv4 route set. A fresh ordinary curl after
+stop reported `IsTor: false`. The kernel-level explanation of the original
+MagicDNS interaction remains a hypothesis; the functional acceptance is now
+verified on that host.
+
+An independent Tor service already occupied the usual SOCKS port. VPNGate now
+selects free ports from SOCKS 9050–9059, TransPort 9040–9049 and DNS 5353–5362,
+without stopping that service. Later status/cleanup use the session's saved
+runtime; a partial config never prevents DNS/IPv6 recovery.
+
+One standalone request encountered a transient TLS disconnect; bounded curl
+retries succeeded. Public Tor exits and checkers can reject individual requests.
+The startup check fails closed and rolls back when it cannot confirm the
+transparent path. Tor still does not transparently proxy arbitrary UDP traffic.
 
 Sources:
 

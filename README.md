@@ -189,7 +189,9 @@ relay is currently known for the requested country.
 Traffic is redirected through an isolated `VPNGATE_TOR` iptables chain - your existing iptables
 rules are never modified. `stop` (or Ctrl+C in foreground mode) removes the chain and stops the
 Tor daemon cleanly. Tor uses a dedicated non-root service account so the
-firewall's Tor-process exemption cannot exempt all root traffic. Startup
+firewall's Tor-process exemption cannot exempt all root traffic. Free listener
+ports are selected automatically within the default ranges, allowing a system
+Tor service to remain running. Status uses the saved session ports. Startup
 verifies the ordinary DNS/TCP path with the Tor Project API and rolls back on
 failure. Original per-interface IPv6 values are saved and restored.
 

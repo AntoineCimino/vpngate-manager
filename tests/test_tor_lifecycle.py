@@ -111,6 +111,45 @@ start_vpn "$DATA_DIR/client.ovpn"
                 process.terminate()
                 process.wait()
 
+    def test_uses_free_ports_without_stopping_existing_tor_service(self):
+        result = self.run_shell(r'''
+ss() { echo 'LISTEN 0 4096 127.0.0.1:9050 0.0.0.0:*'; }
+select_tor_ports || exit 2
+test "$TOR_SOCKS_PORT" = 9051
+test "$TOR_TRANS_PORT" = 9040
+test "$TOR_DNS_PORT" = 5353
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_saved_runtime_recovers_selected_ports_for_status(self):
+        result = self.run_shell(r'''
+runtime=$(mktemp -d /tmp/vpngate-tor.XXXXXX)
+trap 'rm -rf "$runtime"' EXIT
+printf '%s\n' "$runtime" > "$DATA_DIR/tor-runtime"
+printf 'SocksPort 9051\nTransPort 127.0.0.1:9042\nDNSPort 127.0.0.1:5354\n' > "$runtime/torrc"
+tor_runtime_paths || exit 2
+test "$TOR_SOCKS_PORT" = 9051
+test "$TOR_TRANS_PORT" = 9042
+test "$TOR_DNS_PORT" = 5354
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_partial_torrc_does_not_block_cleanup(self):
+        result = self.run_shell(r'''
+runtime=$(mktemp -d /tmp/vpngate-tor.XXXXXX)
+trap 'rm -rf "$runtime"' EXIT
+printf '%s\n' "$runtime" > "$DATA_DIR/tor-runtime"
+printf 'SocksPort ' > "$runtime/torrc"
+touch "$DATA_DIR/tor-ipv6.state"
+sudo() { if [ "$1" = rm ]; then "$@"; else return 0; fi; }
+tor_restore_ipv6() { rm "$DATA_DIR/tor-ipv6.state"; echo 'IPv6 recovered'; }
+stop_tor || exit 2
+test ! -e "$DATA_DIR/tor-ipv6.state"
+test ! -e "$DATA_DIR/tor-runtime"
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('IPv6 recovered', result.stdout)
+
     def test_root_tor_exemption_refused(self):
         result = self.run_shell(r'''
 ps() { echo root; }
